@@ -926,6 +926,38 @@ public class MainForm : Form
     }
 
     /// <summary>
+    /// WorkerW inherits Explorer's DPI context, which may differ from the
+    /// physical monitor displaying this child after a hot-plug. Apply the
+    /// effective screen-to-parent DPI ratio only when it actually changed.
+    /// </summary>
+    private void UpdateWallpaperZoom()
+    {
+        if (!attachedToDesktop || !IsHandleCreated)
+            return;
+        double target = NativeMethods.MonitorDpiAt(boundsBeforeAttach)
+                        / (double)Math.Max(1, NativeMethods.GetDpiForWindow(Handle));
+        try
+        {
+            if (Math.Abs(webView.ZoomFactor - target) > 0.005)
+                webView.ZoomFactor = target;
+        }
+        catch (InvalidOperationException)
+        {
+            // WebView2 controller has not been initialized or was disposed.
+        }
+    }
+
+    private void ResetWallpaperZoom()
+    {
+        try
+        {
+            if (Math.Abs(webView.ZoomFactor - 1.0) > 0.005)
+                webView.ZoomFactor = 1.0;
+        }
+        catch (InvalidOperationException) { }
+    }
+
+    /// <summary>
     /// Discovery may take more than two seconds if Explorer is unavailable.
     /// Do all synchronous EnumWindows/SendMessageTimeout/sleeps off the UI
     /// thread, with one in-flight request and bounded exponential retry delay.
@@ -1022,9 +1054,20 @@ public class MainForm : Form
             : ClampToWorkingArea(Bounds);
         boundsBeforeAttach = Bounds;
 
-        uint dpiBefore = NativeMethods.GetDpiForWindow(Handle);
         var pt = boundsBeforeAttach.Location;
-        NativeMethods.SetParent(Handle, workerW);
+        if (!NativeMethods.TrySetParent(Handle, workerW, out int nativeError))
+        {
+            System.Diagnostics.Debug.WriteLine($"WorkerW attach failed, GetLastError={nativeError}");
+            if (maximizedBeforeAttach)
+            {
+                Bounds = ClampToWorkingArea(normalBoundsBeforeAttach);
+                WindowState = FormWindowState.Maximized;
+            }
+            desktopStateSnapshotValid = false;
+            maximizedBeforeAttach = false;
+            FinishReparentTransition(generation);
+            return;
+        }
         NativeMethods.ScreenToClient(workerW, ref pt);  // child coordinates are WorkerW-relative
         NativeMethods.SetWindowPos(Handle, IntPtr.Zero, pt.X, pt.Y,
             boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE);
@@ -1046,8 +1089,7 @@ public class MainForm : Form
                 {
                     if (!attachedToDesktop)
                         return;
-                    uint dpiAfter = Math.Max(1, NativeMethods.GetDpiForWindow(Handle));
-                    try { webView.ZoomFactor = dpiBefore / (double)dpiAfter; } catch { }
+                    UpdateWallpaperZoom();
                     var p2 = boundsBeforeAttach.Location;
                     NativeMethods.ScreenToClient(workerW, ref p2);
                     NativeMethods.SetWindowPos(Handle, IntPtr.Zero, p2.X, p2.Y,
@@ -1144,7 +1186,10 @@ public class MainForm : Form
             ? Screen.FromRectangle(boundsBeforeAttach).WorkingArea
             : ClampToWorkingArea(boundsBeforeAttach);
         if (target == boundsBeforeAttach)
+        {
+            UpdateWallpaperZoom(); // scale can change without moving the HWND
             return;
+        }
 
         var childLocation = target.Location;
         if (!NativeMethods.ScreenToClient(attachedWorkerW, ref childLocation))
@@ -1154,6 +1199,7 @@ public class MainForm : Form
                 NativeMethods.SWP_NOZORDER_NOACTIVATE))
         {
             boundsBeforeAttach = target;
+            UpdateWallpaperZoom();
             titleBar.Reposition();
         }
     }
@@ -1173,7 +1219,8 @@ public class MainForm : Form
     {
         if (!settings.BehindDesktopIcons || !isClickThrough)
             return;
-        if (attachedToDesktop && NativeMethods.IsWindow(attachedWorkerW))
+        if (attachedToDesktop && NativeMethods.IsWorkerW(attachedWorkerW) &&
+            NativeMethods.HasParent(Handle, attachedWorkerW))
         {
             ReconcileAttachedGeometry();
             return;

@@ -112,8 +112,33 @@ internal static class NativeMethods
 
     // ---- live-wallpaper mode: reparent the widget behind the desktop icons ----
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+
+    private const uint GA_PARENT = 1;
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetDesktopWindow();
+
+    /// <summary>
+    /// A NULL SetParent return is ambiguous for an initially top-level HWND.
+    /// Verify actual native parent with GA_PARENT, not GetParent (which can
+    /// return the owner for WS_POPUP windows).
+    /// </summary>
+    public static bool TrySetParent(IntPtr child, IntPtr parent, out int error)
+    {
+        Marshal.SetLastPInvokeError(0);
+        _ = SetParent(child, parent);
+        error = Marshal.GetLastPInvokeError();
+        var expected = parent == IntPtr.Zero ? GetDesktopWindow() : parent;
+        return GetAncestor(child, GA_PARENT) == expected;
+    }
+
+    public static bool HasParent(IntPtr child, IntPtr parent) =>
+        GetAncestor(child, GA_PARENT) == parent;
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetParent(IntPtr hWnd);
@@ -253,6 +278,9 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(Point point, uint flags);
+
     [DllImport("shcore.dll")]
     private static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
 
@@ -265,6 +293,14 @@ internal static class NativeMethods
     {
         IntPtr monitor = MonitorFromWindow(hwnd, 2 /*MONITOR_DEFAULTTONEAREST*/);
         return GetDpiForMonitor(monitor, 0 /*MDT_EFFECTIVE_DPI*/, out uint dpi, out _) == 0 ? (int)dpi : 96;
+    }
+
+    /// <summary>Effective DPI of the screen that contains a screen-space rectangle.</summary>
+    public static int MonitorDpiAt(Rectangle bounds)
+    {
+        var center = new Point(bounds.Left + bounds.Width / 2, bounds.Top + bounds.Height / 2);
+        IntPtr monitor = MonitorFromPoint(center, 2 /*MONITOR_DEFAULTTONEAREST*/);
+        return GetDpiForMonitor(monitor, 0, out uint dpi, out _) == 0 ? (int)dpi : 96;
     }
 
     /// <summary>
