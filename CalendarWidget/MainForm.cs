@@ -1543,7 +1543,7 @@ public class MainForm : Form
         {
             if (behind)
                 AttachToDesktop();
-            else if (attachedToDesktop && !DetachFromDesktop())
+            else if (!DetachFromDesktop())
             {
                 pendingWallpaperDetach = true;
                 RecordDesktopDiscoveryFailure();
