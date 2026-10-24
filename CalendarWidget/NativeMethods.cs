@@ -122,6 +122,32 @@ internal static class NativeMethods
 
     private const uint GA_PARENT = 1;
     private const uint GA_ROOTOWNER = 3;
+    private const uint GW_HWNDNEXT = 2;
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+
+    /// <summary>
+    /// True only if lower occurs below upper in the current native Z-order.
+    /// Bound traversal because Explorer may be rebuilding the window stack.
+    /// </summary>
+    public static bool IsAboveInZOrder(IntPtr upper, IntPtr lower)
+    {
+        if (upper == IntPtr.Zero || lower == IntPtr.Zero || upper == lower ||
+            !IsWindow(upper) || !IsWindow(lower))
+            return false;
+
+        var current = upper;
+        for (int i = 0; i < 1024; i++)
+        {
+            current = GetWindow(current, GW_HWNDNEXT);
+            if (current == IntPtr.Zero)
+                return false;
+            if (current == lower)
+                return true;
+        }
+        return false;
+    }
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);

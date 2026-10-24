@@ -71,6 +71,9 @@ public class MainForm : Form
     // Use it only to shorten the foreground settle after an actual focus exit.
     private long restoreTransitionUntil;
     private long restoreForegroundHintUntil;
+    // A MINIMIZEEND hint cannot prove Win+D. Once restoration has settled,
+    // check the actual normal Z-order so unrelated foreground apps stay above us.
+    private long pendingRestoreZOrderCheckAt;
     private IntPtr lastForegroundEventWindow;
     private readonly NativeMethods.WinEventProc foregroundCallback;
     private IntPtr foregroundHook;
@@ -534,6 +537,7 @@ public class MainForm : Form
             {
                 // A new Win+D starts a distinct desktop foreground episode.
                 restoreForegroundHintUntil = 0;
+                pendingRestoreZOrderCheckAt = 0;
                 if (lastForegroundEventWindow != IntPtr.Zero)
                 {
                     restoreTransitionUntil = 0;
@@ -582,6 +586,7 @@ public class MainForm : Form
 
             if (isClickThrough || !settings.KeepInteractiveVisibleOnDesktop)
             {
+                pendingRestoreZOrderCheckAt = 0;
                 CancelPendingDesktopDemotion();
                 if (isReallyTopmost || interactiveDesktopTopmost)
                     ReleaseInteractiveDesktopPromotion();
@@ -591,6 +596,7 @@ public class MainForm : Form
             IntPtr foreground = NativeMethods.GetForegroundWindow();
             if (NativeMethods.IsDesktopForeground(foreground))
             {
+                pendingRestoreZOrderCheckAt = 0;
                 CancelPendingDesktopDemotion();
                 if (isReallyTopmost)
                 {
@@ -615,10 +621,18 @@ public class MainForm : Form
 
             if (!isReallyTopmost)
             {
-                // Explorer (or another program) may have already removed
-                // topmost. The watchdog must notice and clear its stale flag.
                 interactiveDesktopTopmost = false;
                 CancelPendingDesktopDemotion();
+                if (pendingRestoreZOrderCheckAt != 0 &&
+                    now >= pendingRestoreZOrderCheckAt)
+                {
+                    // Explorer's restore animation has finished. Most Win+D
+                    // sequences leave the native order correct: only change
+                    // it if our HWND still sits above the active app's owner.
+                    pendingRestoreZOrderCheckAt = 0;
+                    if (foreground != IntPtr.Zero && !IsOurForegroundWindow(foreground))
+                        PlaceBelowForegroundAppIfNeeded(foreground);
+                }
                 return;
             }
 
@@ -639,6 +653,11 @@ public class MainForm : Form
                 restoreForegroundHintUntil = 0;
                 restoreTransitionUntil = now + 1200;
                 ReleaseInteractiveDesktopPromotion(); // HWND_NOTOPMOST only
+                // A generic MINIMIZEEND may have been unrelated to Win+D.
+                // Defer the normal-app Z-order check until Explorer has had
+                // time to complete any genuine restore animation.
+                if (!NativeMethods.IsTopmost(Handle))
+                    pendingRestoreZOrderCheckAt = restoreTransitionUntil;
                 return;
             }
             restoreForegroundHintUntil = 0;
@@ -660,6 +679,32 @@ public class MainForm : Form
         {
             updatingDesktopVisibility = false;
         }
+    }
+
+    /// <summary>
+    /// Reposition only if our calendar is still above the foreground app's
+    /// root owner. Do not disturb Z-order if Explorer already fixed it.
+    /// Called after a settled ordinary switch, or as a delayed safety check
+    /// after an ambiguous MINIMIZEEND hint.
+    /// </summary>
+    private void PlaceBelowForegroundAppIfNeeded(IntPtr foreground)
+    {
+        if (foreground == IntPtr.Zero || foreground == Handle ||
+            !NativeMethods.IsWindow(foreground) ||
+            NativeMethods.IsDesktopForeground(foreground) ||
+            NativeMethods.IsTopmost(foreground) ||
+            NativeMethods.IsTopmost(Handle))
+            return;
+
+        IntPtr rootOwner = NativeMethods.RootOwner(foreground);
+        IntPtr anchor = rootOwner != IntPtr.Zero && rootOwner != Handle &&
+            !NativeMethods.IsTopmost(rootOwner) ? rootOwner : foreground;
+        if (anchor == Handle || !NativeMethods.IsAboveInZOrder(Handle, anchor))
+            return; // already below the active app, no flicker-inducing move
+
+        if (!NativeMethods.SetWindowPos(Handle, anchor,
+                0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE))
+            System.Diagnostics.Debug.WriteLine("Could not place calendar below foreground app owner");
     }
 
     private void ReleaseInteractiveDesktopPromotion(IntPtr stableAppForeground = default)
@@ -689,23 +734,11 @@ public class MainForm : Form
         if (interactiveDesktopTopmost)
             return;
 
-        // MINIMIZEEND/desktop restore calls this without an app argument:
-        // the extra reorder would revive the previously fixed flicker.
-        // An owned modal dialog sits above its application's root owner.
-        // Position below that owner, not between the dialog and main window.
-        // Reverse Win+D still calls this method without an app HWND.
-        if (stableAppForeground != IntPtr.Zero && stableAppForeground != Handle &&
-            NativeMethods.IsWindow(stableAppForeground) &&
-            !NativeMethods.IsDesktopForeground(stableAppForeground) &&
-            !NativeMethods.IsTopmost(stableAppForeground))
-        {
-            IntPtr rootOwner = NativeMethods.RootOwner(stableAppForeground);
-            IntPtr anchor = rootOwner != IntPtr.Zero && rootOwner != Handle &&
-                !NativeMethods.IsTopmost(rootOwner) ? rootOwner : stableAppForeground;
-            if (!NativeMethods.SetWindowPos(Handle, anchor,
-                    0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE))
-                System.Diagnostics.Debug.WriteLine("Could not place calendar below foreground app owner");
-        }
+        // Reverse Win+D passes no foreground anchor and remains a one-call
+        // HWND_NOTOPMOST operation. Ordinary app switches are positioned below
+        // their root owner, but only if the current native order requires it.
+        if (stableAppForeground != IntPtr.Zero)
+            PlaceBelowForegroundAppIfNeeded(stableAppForeground);
     }
 
     // pin the window to the bottom of the Z-order: any attempt to raise it
@@ -1600,7 +1633,8 @@ public class MainForm : Form
             RetryPendingWallpaperDetach();
 
         // Separate foreground handling from the mouse-hover panel.
-        if (pendingDemotionForeground != IntPtr.Zero || ++showDesktopPoll >= 10)
+        if (pendingDemotionForeground != IntPtr.Zero ||
+            pendingRestoreZOrderCheckAt != 0 || ++showDesktopPoll >= 10)
         {
             // Normal mode: one 1-second verification. On a reverse Win+D
             // transition, check pending demotion at the existing 100 ms tick.
