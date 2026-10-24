@@ -4,27 +4,55 @@
 
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
-using System.Drawing.Text;
+using System.Globalization;
 using System.Runtime.InteropServices;
+using Microsoft.Win32;
 
 namespace CalendarWidget;
 
 /// <summary>
-/// A dynamic Windows tray icon: calendar sheet, small 'G' and current local
-/// day of month. A conventional pointer overlays the lower-right corner
-/// only while calendar interaction is enabled.
-///
-/// Drawn at 64px, so the day stays legible on common 16/24/32px taskbar sizes.
-/// The caller owns the returned Icon and must dispose it when replacing it.
+/// Monochrome taskbar calendar date, with no badge, sheet, or background.
+/// A filled number means wallpaper/click-through mode; a 1-pixel outline
+/// means effective interactive mode. Follows Windows' SYSTEM/taskbar theme
+/// rather than AppsUseLightTheme, which can differ in custom light/dark mode.
 /// </summary>
 internal static class TrayIconRenderer
 {
+    // Render at 4x the usual 16px notification area icon so downsampling
+    // produces smooth numerals. Four source pixels equal one displayed pixel.
     private const int Size = 64;
+    private const float OutlineWidth = 4f;
+    private const string ThemeKey =
+        @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 
     [DllImport("user32.dll")]
     private static extern bool DestroyIcon(IntPtr hIcon);
 
-    public static Icon Create(int day, bool interactive)
+    public static Color GetTaskbarTextColor()
+    {
+        // High contrast takes precedence over dark/light theme preferences.
+        if (SystemInformation.HighContrast)
+            return SystemColors.WindowText;
+
+        try
+        {
+            // 0 = dark Windows taskbar (light clock text); 1 = light taskbar.
+            // The app's own AppsUseLightTheme flag is NOT what controls the tray.
+            if (Registry.GetValue(ThemeKey, "SystemUsesLightTheme", null) is int light)
+                return light == 0
+                    ? Color.FromArgb(245, 245, 245)
+                    : Color.FromArgb(32, 32, 32);
+        }
+        catch (Exception ex) when (ex is System.Security.SecurityException
+                                  or UnauthorizedAccessException or IOException)
+        {
+            // Restricted registry access: use a legible default for the
+            // standard dark taskbar, without breaking tray functionality.
+        }
+        return Color.FromArgb(245, 245, 245);
+    }
+
+    public static Icon Create(int day, bool interactive, Color ink)
     {
         if (day is < 1 or > 31)
             throw new ArgumentOutOfRangeException(nameof(day));
@@ -34,59 +62,42 @@ internal static class TrayIconRenderer
         {
             g.Clear(Color.Transparent);
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
 
-            using var outline = RoundRectangle(new RectangleF(3, 2, 58, 60), 9);
-            using var paper = new SolidBrush(Color.FromArgb(250, 252, 255));
-            using var header = new SolidBrush(Color.FromArgb(50, 112, 222));
-            using var border = new Pen(Color.FromArgb(30, 51, 86), 2.4f);
-            g.FillPath(paper, outline);
+            using var path = new GraphicsPath();
+            using var family = new FontFamily("Segoe UI");
+            using var format = (StringFormat)StringFormat.GenericTypographic.Clone();
+            path.AddString(day.ToString(CultureInfo.InvariantCulture), family,
+                (int)FontStyle.Bold, 53f, PointF.Empty, format);
 
-            // Clip the colored header to the calendar's rounded silhouette.
-            var state = g.Save();
-            g.SetClip(outline);
-            g.FillRectangle(header, 3, 2, 58, 22);
-            g.Restore(state);
-            g.DrawPath(border, outline);
-
-            using var align = new StringFormat
-            {
-                Alignment = StringAlignment.Center,
-                LineAlignment = StringAlignment.Center,
-                FormatFlags = StringFormatFlags.NoWrap,
-            };
-            using var glyphFont = new Font("Segoe UI", 16, FontStyle.Bold, GraphicsUnit.Pixel);
-            using var dateFont = new Font("Segoe UI", 36, FontStyle.Bold, GraphicsUnit.Pixel);
-            using var white = new SolidBrush(Color.White);
-            using var ink = new SolidBrush(Color.FromArgb(29, 42, 70));
-
-            g.DrawString("G", glyphFont, white, new RectangleF(3, 3, 58, 21), align);
-            g.DrawString(day.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                dateFont, ink, new RectangleF(4, 24, 56, 36), align);
+            // Center the actual numeral contour (not its font line box).
+            // Leave room for the one-pixel interactive stroke at 16px scale.
+            var bounds = path.GetBounds();
+            float scale = Math.Min(52f / bounds.Width, 52f / bounds.Height);
+            using var centered = new Matrix();
+            centered.Translate(-bounds.Left, -bounds.Top);
+            centered.Scale(scale, scale, MatrixOrder.Append);
+            centered.Translate((Size - bounds.Width * scale) / 2f,
+                (Size - bounds.Height * scale) / 2f, MatrixOrder.Append);
+            path.Transform(centered);
 
             if (interactive)
             {
-                // High-contrast mouse pointer, recognizable even when the tray
-                // icon is reduced to 16x16. A small overlay leaves the day readable.
-                var vertices = new[]
+                using var stroke = new Pen(ink, OutlineWidth)
                 {
-                    new PointF(42, 39), new PointF(42, 59), new PointF(47, 54),
-                    new PointF(51, 62), new PointF(56, 59), new PointF(51, 51),
-                    new PointF(59, 49),
+                    LineJoin = LineJoin.Round,
                 };
-                using var pointer = new GraphicsPath();
-                pointer.AddLines(vertices);
-                pointer.CloseFigure();
-                using var halo = new Pen(Color.FromArgb(18, 25, 40), 3.5f)
-                { LineJoin = LineJoin.Round };
-                g.FillPath(white, pointer);
-                g.DrawPath(halo, pointer);
+                g.DrawPath(stroke, path);
+            }
+            else
+            {
+                using var fill = new SolidBrush(ink);
+                g.FillPath(fill, path);
             }
         }
 
-        // Bitmap.GetHicon allocates a native HICON. FromHandle does not own it.
-        // Clone to create a managed Icon, then destroy the temporary HICON.
+        // GetHicon allocates a native HICON; Icon.FromHandle does not own it.
+        // Clone so NotifyIcon can keep it after we destroy the temporary HICON.
         var hIcon = bitmap.GetHicon();
         try
         {
@@ -97,17 +108,5 @@ internal static class TrayIconRenderer
         {
             DestroyIcon(hIcon);
         }
-    }
-
-    private static GraphicsPath RoundRectangle(RectangleF r, float radius)
-    {
-        var d = radius * 2;
-        var path = new GraphicsPath();
-        path.AddArc(r.Left, r.Top, d, d, 180, 90);
-        path.AddArc(r.Right - d, r.Top, d, d, 270, 90);
-        path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
-        path.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
-        path.CloseFigure();
-        return path;
     }
 }

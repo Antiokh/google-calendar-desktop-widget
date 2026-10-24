@@ -26,6 +26,7 @@ public class MainForm : Form
     private Icon? renderedTrayIcon;
     private DateTime renderedTrayDate;
     private bool renderedTrayInteraction;
+    private int renderedTrayColorArgb;
     private readonly System.Windows.Forms.Timer hoverPoll = new() { Interval = 100 };
     private readonly HoverPanel hoverPanel;
     private readonly TitleBar titleBar;
@@ -851,6 +852,15 @@ public class MainForm : Form
         }
 
         base.WndProc(ref m);
+
+        // The taskbar can change independently of the application theme.
+        // Theme/contrast changes redraw immediately; the existing 30s timer
+        // catches external theme switchers that do not broadcast messages.
+        if (renderedTrayIcon is not null &&
+            (m.Msg == NativeMethods.WM_SETTINGCHANGE ||
+             m.Msg == NativeMethods.WM_THEMECHANGED ||
+             m.Msg == NativeMethods.WM_SYSCOLORCHANGE))
+            RefreshTrayIcon();
     }
 
     // WinForms recreates the handle for some property changes; re-apply manual styles if so
@@ -1846,8 +1856,9 @@ public class MainForm : Form
     }
 
     /// <summary>
-    /// Render a tiny calendar containing the system-local day and the interaction state.
-    /// The previous owned icon is disposed after NotifyIcon starts using the new handle.
+    /// Render the date in the Windows taskbar's foreground color: filled in
+    /// wallpaper mode, thin numeral outline in effective interactive mode.
+    /// Disposes the old native icon after NotifyIcon adopts the replacement.
     /// </summary>
     private void RefreshTrayIcon()
     {
@@ -1856,15 +1867,17 @@ public class MainForm : Form
         string status = pendingInteractiveDetach
             ? "Switching to interactive" : effectivelyInteractive ? "Interactive" : "Wallpaper";
         tray.Text = $"Google Calendar - {today:dd MMM yyyy} - " + status;
+        Color ink = TrayIconRenderer.GetTaskbarTextColor();
         if (renderedTrayIcon is not null
             && renderedTrayDate == today
-            && renderedTrayInteraction == effectivelyInteractive)
+            && renderedTrayInteraction == effectivelyInteractive
+            && renderedTrayColorArgb == ink.ToArgb())
             return;
 
         Icon? replacement;
         try
         {
-            replacement = TrayIconRenderer.Create(today.Day, effectivelyInteractive);
+            replacement = TrayIconRenderer.Create(today.Day, effectivelyInteractive, ink);
         }
         catch (Exception)
         {
@@ -1877,6 +1890,7 @@ public class MainForm : Form
         tray.Icon = replacement;
         renderedTrayDate = today;
         renderedTrayInteraction = effectivelyInteractive;
+        renderedTrayColorArgb = ink.ToArgb();
         previous?.Dispose();
     }
 
