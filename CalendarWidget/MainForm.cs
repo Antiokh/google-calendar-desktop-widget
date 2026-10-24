@@ -933,6 +933,10 @@ public class MainForm : Form
             // Native Explorer interactions can fail when the shell restarts;
             // keep an async-void continuation from crashing the UI thread.
             System.Diagnostics.Debug.WriteLine($"WorkerW discovery failed: {ex}");
+            // If reparenting itself failed after suspending painting, do not
+            // leave the browser's native window frozen until another retry.
+            if (reparentInProgress)
+                CancelReparentTransition();
             desktopDiscoveryFailures = Math.Min(desktopDiscoveryFailures + 1, 5);
             nextDesktopDiscoveryAt = Environment.TickCount64 +
                 Math.Min(30000, 2000L << (desktopDiscoveryFailures - 1));
