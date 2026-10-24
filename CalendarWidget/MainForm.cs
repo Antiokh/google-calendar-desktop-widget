@@ -163,6 +163,11 @@ public class MainForm : Form
     private static Rectangle ClampToWorkingArea(Rectangle saved)
     {
         var work = Screen.FromRectangle(saved).WorkingArea;
+        // Preserve intentionally small but already-fully-visible windows.
+        // Apply minimum recovery dimensions only when the old geometry no
+        // longer fits the available work area.
+        if (work.Contains(saved))
+            return saved;
         int width = Math.Clamp(saved.Width, Math.Min(320, work.Width), work.Width);
         int height = Math.Clamp(saved.Height, Math.Min(200, work.Height), work.Height);
         int x = Math.Clamp(saved.X, work.Left, work.Right - width);
@@ -923,8 +928,11 @@ public class MainForm : Form
             ResetDesktopDiscoveryBackoff();
             AttachToWorkerW(workerW);
         }
-        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+        catch (Exception ex)
         {
+            // Native Explorer interactions can fail when the shell restarts;
+            // keep an async-void continuation from crashing the UI thread.
+            System.Diagnostics.Debug.WriteLine($"WorkerW discovery failed: {ex}");
             desktopDiscoveryFailures = Math.Min(desktopDiscoveryFailures + 1, 5);
             nextDesktopDiscoveryAt = Environment.TickCount64 +
                 Math.Min(30000, 2000L << (desktopDiscoveryFailures - 1));
@@ -1034,6 +1042,7 @@ public class MainForm : Form
             {
                 if (maximizedBeforeAttach)
                 {
+                    normalBoundsBeforeAttach = ClampToWorkingArea(normalBoundsBeforeAttach);
                     Bounds = normalBoundsBeforeAttach;
                     WindowState = FormWindowState.Maximized;
                 }
@@ -1052,6 +1061,7 @@ public class MainForm : Form
         Bounds = boundsBeforeAttach;
         if (maximizedBeforeAttach)
         {
+            normalBoundsBeforeAttach = ClampToWorkingArea(normalBoundsBeforeAttach);
             Bounds = normalBoundsBeforeAttach;  // seed RestoreBounds with the original rect
             WindowState = FormWindowState.Maximized;
         }
