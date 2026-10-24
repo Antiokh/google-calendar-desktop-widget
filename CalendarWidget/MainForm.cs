@@ -421,7 +421,13 @@ public class MainForm : Form
         }
         else
         {
-            DetachFromDesktop();  // interactive mode is always a normal top-level window
+            if (!DetachFromDesktop())
+            {
+                // Never expose interactive input while still a WorkerW child.
+                isClickThrough = true;
+                calendarInteractionEnabled = false;
+                return;
+            }
             styleBurst = 0;
             NativeMethods.DisableClickThrough(clickThroughApplied);
             NativeMethods.RemoveExStyle(Handle, NativeMethods.WS_EX_NOACTIVATE);
@@ -1109,12 +1115,13 @@ public class MainForm : Form
         }
     }
 
-    private void DetachFromDesktop()
+    private bool DetachFromDesktop()
     {
         if (!attachedToDesktop)
         {
-            // The WorkerW watchdog may already have returned us to the
-            // top-level desktop. Restore the saved maximize state anyway.
+            // Orphan recovery returned the window to top-level; the old
+            // wallpaper DPI compensation must not survive interactive mode.
+            ResetWallpaperZoom();
             if (desktopStateSnapshotValid)
             {
                 if (maximizedBeforeAttach)
@@ -1126,15 +1133,20 @@ public class MainForm : Form
                 desktopStateSnapshotValid = false;
                 maximizedBeforeAttach = false;
             }
-            return;
+            return true;
         }
         int generation = ++reparentGeneration;
         reparentInProgress = true;
         NativeMethods.SetRedraw(Handle, false);
-        NativeMethods.SetParent(Handle, IntPtr.Zero);
+        if (!NativeMethods.TrySetParent(Handle, IntPtr.Zero, out int nativeError))
+        {
+            System.Diagnostics.Debug.WriteLine($"WorkerW detach failed, GetLastError={nativeError}");
+            FinishReparentTransition(generation);
+            return false;
+        }
         attachedToDesktop = false;
         attachedWorkerW = IntPtr.Zero;
-        try { webView.ZoomFactor = 1.0; } catch { }
+        ResetWallpaperZoom();
         Bounds = boundsBeforeAttach;
         if (maximizedBeforeAttach)
         {
@@ -1170,6 +1182,7 @@ public class MainForm : Form
         {
             FinishReparentTransition(generation);
         }
+        return true;
     }
 
     /// <summary>
@@ -1232,9 +1245,17 @@ public class MainForm : Form
             // Always thaw even if no replacement WorkerW can be discovered.
             try
             {
-                NativeMethods.SetParent(Handle, IntPtr.Zero);
+                if (!NativeMethods.TrySetParent(Handle, IntPtr.Zero, out int nativeError))
+                {
+                    System.Diagnostics.Debug.WriteLine($"WorkerW orphan recovery failed, GetLastError={nativeError}");
+                    desktopDiscoveryFailures = Math.Min(desktopDiscoveryFailures + 1, 5);
+                    nextDesktopDiscoveryAt = Environment.TickCount64 +
+                        Math.Min(30000, 2000L << (desktopDiscoveryFailures - 1));
+                    return;  // retain native attachment state until a successful detach
+                }
                 attachedToDesktop = false;
                 attachedWorkerW = IntPtr.Zero;
+                ResetWallpaperZoom();
                 boundsBeforeAttach = maximizedBeforeAttach
                     ? Screen.FromRectangle(boundsBeforeAttach).WorkingArea
                     : ClampToWorkingArea(boundsBeforeAttach);
@@ -1272,8 +1293,14 @@ public class MainForm : Form
             }
             else
             {
-                DetachFromDesktop();
-                NativeMethods.SendToBottom(Handle);
+                if (DetachFromDesktop())
+                    NativeMethods.SendToBottom(Handle);
+                else
+                {
+                    // Preserve the actual wallpaper state after native failure.
+                    settings.BehindDesktopIcons = true;
+                    settingsForm?.SyncBehindDesktopIcons(true);
+                }
             }
         }
         settings.Save();
