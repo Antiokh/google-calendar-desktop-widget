@@ -50,6 +50,13 @@ public class MainForm : Form
     private bool interactiveDesktopTopmost;
     private bool updatingDesktopVisibility;
     private int showDesktopPoll;
+    // The reverse Win+D gesture briefly changes Explorer's foreground chain.
+    // Let it settle before dropping our temporary topmost state.
+    private const long ForegroundSettleMs = 180;
+    private const long PromotionRetryMs = 1000;
+    private IntPtr pendingDemotionForeground;
+    private long pendingDemotionStartedAt;
+    private long nextPromotionAttemptAt;
     private readonly NativeMethods.WinEventProc foregroundCallback;
     private IntPtr foregroundHook;
     private Rectangle normalBoundsBeforeAttach;  // the pre-maximize rect to give back to RestoreBounds
@@ -396,9 +403,9 @@ public class MainForm : Form
     }
 
     /// <summary>
-    /// Explorer moves the desktop to the top of the Z-order on Win+D.
-    /// Respond to EVENT_SYSTEM_FOREGROUND immediately rather than up to 300 ms
-    /// after the fact. A slow timer remains as a fallback for unusual shells.
+    /// An event triggers the first reconciliation promptly; the existing hover
+    /// timer provides a low-cost one-second watchdog and drives a short,
+    /// stable-foreground cooldown on the *reverse* Show Desktop gesture.
     /// </summary>
     private void OnForegroundWindowChanged(
         IntPtr hook, uint eventType, IntPtr hwnd,
@@ -410,41 +417,96 @@ public class MainForm : Form
         MaintainInteractiveDesktopVisibility();
     }
 
+    private bool IsOurForegroundWindow(IntPtr hwnd) =>
+        hwnd == Handle ||
+        (titleBar.IsHandleCreated && hwnd == titleBar.Handle) ||
+        (settingsForm is not null && settingsForm.IsHandleCreated &&
+         hwnd == settingsForm.Handle);
+
+    private void CancelPendingDesktopDemotion()
+    {
+        pendingDemotionForeground = IntPtr.Zero;
+        pendingDemotionStartedAt = 0;
+    }
+
+    /// <summary>
+    /// Make only necessary Z-order changes. The source of truth is the
+    /// window's current WS_EX_TOPMOST bit and foreground HWND, not merely the
+    /// previous request recorded in interactiveDesktopTopmost.
+    /// </summary>
     private void MaintainInteractiveDesktopVisibility()
     {
-        if (updatingDesktopVisibility)
+        if (updatingDesktopVisibility || !IsHandleCreated || IsDisposed)
             return;
 
         updatingDesktopVisibility = true;
         try
         {
-            if (isClickThrough || !settings.KeepInteractiveVisibleOnDesktop || !IsHandleCreated)
+            long now = Environment.TickCount64;
+            bool isReallyTopmost = NativeMethods.IsTopmost(Handle);
+
+            if (isClickThrough || !settings.KeepInteractiveVisibleOnDesktop)
             {
-                ReleaseInteractiveDesktopPromotion();
+                CancelPendingDesktopDemotion();
+                if (isReallyTopmost || interactiveDesktopTopmost)
+                    ReleaseInteractiveDesktopPromotion();
                 return;
             }
 
             IntPtr foreground = NativeMethods.GetForegroundWindow();
             if (NativeMethods.IsDesktopForeground(foreground))
             {
-                if (!interactiveDesktopTopmost)
+                CancelPendingDesktopDemotion();
+                if (isReallyTopmost)
                 {
-                    // WS_MINIMIZEBOX is disabled for this window, but a
-                    // defensive restore handles other ways it might be minimized.
-                    if (WindowState == FormWindowState.Minimized)
-                        WindowState = settings.WinMaximized
-                            ? FormWindowState.Maximized : FormWindowState.Normal;
-                    if (NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_TOPMOST,
-                        0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE))
-                        interactiveDesktopTopmost = true;
+                    interactiveDesktopTopmost = true;
+                    return;  // no extra SetWindowPos call on each event/poll
                 }
+
+                interactiveDesktopTopmost = false;
+                if (now < nextPromotionAttemptAt)
+                    return;  // avoid repeated Z-order battles with Explorer
+
+                nextPromotionAttemptAt = now + PromotionRetryMs;
+                if (NativeMethods.IsIconic(Handle))
+                    WindowState = settings.WinMaximized
+                        ? FormWindowState.Maximized : FormWindowState.Normal;
+
+                if (NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_TOPMOST,
+                    0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE))
+                    interactiveDesktopTopmost = NativeMethods.IsTopmost(Handle);
+                return;
             }
-            else if (interactiveDesktopTopmost &&
-                     foreground != Handle &&
-                     (!titleBar.IsHandleCreated || foreground != titleBar.Handle) &&
-                     (settingsForm is null || !settingsForm.IsHandleCreated || foreground != settingsForm.Handle))
+
+            if (!isReallyTopmost)
+            {
+                // Explorer (or another program) may have already removed
+                // topmost. The watchdog must notice and clear its stale flag.
+                interactiveDesktopTopmost = false;
+                CancelPendingDesktopDemotion();
+                return;
+            }
+
+            // Our own calendar / settings gaining focus is not the end of
+            // desktop mode. A null foreground is also a transient shell state.
+            if (foreground == IntPtr.Zero || IsOurForegroundWindow(foreground))
+            {
+                CancelPendingDesktopDemotion();
+                return;
+            }
+
+            if (pendingDemotionForeground != foreground)
+            {
+                pendingDemotionForeground = foreground;
+                pendingDemotionStartedAt = now;
+            }
+
+            // In the reverse gesture, don't shove the window behind Explorer
+            // while Windows is still animating the restoration of other windows.
+            if (now - pendingDemotionStartedAt >= ForegroundSettleMs)
             {
                 ReleaseInteractiveDesktopPromotion();
+                CancelPendingDesktopDemotion();
             }
         }
         finally
@@ -455,14 +517,24 @@ public class MainForm : Form
 
     private void ReleaseInteractiveDesktopPromotion()
     {
-        if (!interactiveDesktopTopmost)
-            return;
-        interactiveDesktopTopmost = false;
+        CancelPendingDesktopDemotion();
         if (!IsHandleCreated)
+        {
+            interactiveDesktopTopmost = false;
             return;
-        // HWND_BOTTOM removes topmost status and moves directly to the back
-        // in ONE operation, avoiding an intermediate redraw at NOTOPMOST.
-        NativeMethods.SendToBottom(Handle);
+        }
+
+        // Only a genuinely topmost window requires changing the native Z-order.
+        if (!NativeMethods.IsTopmost(Handle))
+        {
+            interactiveDesktopTopmost = false;
+            return;
+        }
+
+        // HWND_BOTTOM clears TOPMOST and restores bottom Z-order in a single
+        // native operation. Ignore a failed call; the watchdog can retry it.
+        if (NativeMethods.SendToBottom(Handle))
+            interactiveDesktopTopmost = NativeMethods.IsTopmost(Handle);
     }
 
     // pin the window to the bottom of the Z-order: any attempt to raise it
@@ -924,10 +996,12 @@ public class MainForm : Form
     private void CheckMouseHover()
     {
         // Separate foreground handling from the mouse-hover panel.
-        if (++showDesktopPoll >= 10)
+        if (pendingDemotionForeground != IntPtr.Zero || ++showDesktopPoll >= 10)
         {
+            // Normal mode: one 1-second verification. On a reverse Win+D
+            // transition, check pending demotion at the existing 100 ms tick.
             showDesktopPoll = 0;
-            MaintainInteractiveDesktopVisibility();  // 1-second safety check only
+            MaintainInteractiveDesktopVisibility();
         }
         // interactive mode: controls are integrated in the title bar; the corner panel only
         // shows as a settings preview, which just has to time out

@@ -12,6 +12,7 @@ internal static class NativeMethods
 
     public const long WS_EX_TRANSPARENT = 0x00000020;  // mouse passes through
     public const long WS_EX_NOACTIVATE = 0x08000000;   // never steals keyboard focus
+    public const long WS_EX_TOPMOST = 0x00000008;     // actual topmost state, not our cached flag
     public const int WS_MINIMIZEBOX = 0x00020000;
     public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
     public const uint WINEVENT_OUTOFCONTEXT = 0;
@@ -97,8 +98,16 @@ internal static class NativeMethods
         applied.Clear();
     }
 
-    public static void SendToBottom(IntPtr hwnd) =>
+    public static bool SendToBottom(IntPtr hwnd) =>
         SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE_NOMOVE_NOACTIVATE);
+
+    /// <summary>Read the OS state rather than trusting our last SetWindowPos call.</summary>
+    public static bool IsTopmost(IntPtr hwnd) =>
+        (GetWindowLongPtr(hwnd, GWL_EXSTYLE).ToInt64() & WS_EX_TOPMOST) != 0;
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsIconic(IntPtr hwnd);
 
     // ---- live-wallpaper mode: reparent the widget behind the desktop icons ----
 

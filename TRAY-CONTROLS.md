@@ -47,3 +47,12 @@ Note: on taskbars that display tray icons at only 16×16, the date is prioritize
 - When leaving the temporary desktop-visible state, use a single `SetWindowPos(HWND_BOTTOM)`, which both removes the topmost flag and restores bottom Z-order. No intermediate `HWND_NOTOPMOST` move.
 - Foreground callback stays rooted for the application's lifetime and is unhooked on exit.
 - These changes reduce avoidable composition churn; Explorer and WebView2 might still create a one-frame flash on some Windows builds.
+
+
+### Native-state reconciliation and reverse-gesture flicker
+
+- The foreground-event callback and the existing 100 ms UI timer now invoke a **single idempotent reconciliation method**. In steady state, the timer reconciles once per second; no new thread or timer is created.
+- Read actual `WS_EX_TOPMOST` via `GetWindowLongPtr` and `IsIconic` for the native minimized state, rather than trusting an internal boolean flag. Correct externally changed Z-order, but never issue redundant `SetWindowPos` calls.
+- On returning from Show Desktop, wait until the same non-desktop foreground window remains stable for ~180 ms before dropping temporary `TOPMOST` status. The existing 100 ms timer completes this transition even if there is no second foreground event.
+- Promotion retries are limited to once per second if Explorer repeatedly overrides Z-order; safety checks retain a once-per-second cadence.
+- This addresses a plausible source of reverse-gesture flicker (premature `HWND_BOTTOM`), but Windows shell animations can still briefly cover the widget on some configurations. Please test Win+D, taskbar Show Desktop, trackpad reverse gesture, and switching to regular applications.
