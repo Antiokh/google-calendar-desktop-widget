@@ -60,3 +60,11 @@ Existing Google sign-in and local settings are preserved in `%LOCALAPPDATA%\Cale
 - Native `SetParent` failure triggers the same exponential (2–30 second) backoff as WorkerW discovery failure. The retry gate is also enforced on orphan recovery; backoff resets only after a successful attachment, explicit user toggle, or display-change event.
 - `WM_DISPLAYCHANGE` now handles ordinary top-level interactive and non-WorkerW click-through windows as well as attached wallpapers. A one-second fallback catches late monitor changes; top-level windows are repositioned only when at least 20% of their normal rectangle is inaccessible. Maximized state is preserved, while a changed monitor's working area is used for its restore bounds.
 - `SetParent` WS_CHILD/WS_POPUP compatibility remains a known device-testing concern; it was deliberately not changed in this patch because that could regress already working desktop attachment.
+
+
+### Restore accessibility and deferred interaction
+
+- Recovery checks the usable top-left caption/drag zone **in addition to** overall visible window area. A window whose header is entirely above the monitor is relocated even if over 80% of its rectangle is visible.
+- A normal window deliberately spanning two screens is kept in place when it remains mostly visible **and** its grab strip is accessible, consistently at startup, WorkerW attach/recovery and while top-level.
+- A transient native detach failure no longer discards the user's request for calendar interaction. The desired setting remains checked, while actual click-through input is retained until verified top-level parenting. The existing 100 ms timer retries only when the shared 2–30 s native backoff allows it. Clicking the interaction toggle again cancels that request.
+- The tray icon represents **effective** interaction mode; the menu says `retrying…` while activation is pending. Sign-in does not activate a WorkerW child until detach succeeds. No new timer or thread is added.

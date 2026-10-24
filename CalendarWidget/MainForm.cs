@@ -45,6 +45,9 @@ public class MainForm : Form
     private bool desktopDiscoveryInFlight;
     private int desktopDiscoveryFailures;
     private long nextDesktopDiscoveryAt;
+    // Desired calendar interaction survives a transient native detach failure.
+    // The actual OS click-through state stays enabled until detach succeeds.
+    private bool pendingInteractiveDetach;
     private bool attachedToDesktop;       // reparented into WorkerW (behind the desktop icons)
     private IntPtr attachedWorkerW;       // the specific WorkerW we parented into; its destruction = orphaned
     private Rectangle boundsBeforeAttach; // screen bounds to restore on detach (child coords are parent-relative)
@@ -178,28 +181,47 @@ public class MainForm : Form
     }
 
     /// <summary>
-    /// The window may intentionally span adjacent screens. Only recover it
-    /// when most of its normal rectangle is no longer visible on any working
-    /// area, rather than snapping legitimate cross-monitor layouts.
+    /// Preserve genuinely usable layouts spanning multiple screens. Visible
+    /// area alone is insufficient: the upper drag/header strip must remain
+    /// reachable, including if the title bar is temporarily hidden.
     /// </summary>
     private static bool NeedsOffscreenRecovery(Rectangle bounds)
     {
         if (bounds.Width <= 0 || bounds.Height <= 0)
             return true;
         long visibleArea = 0;
-        foreach (var screen in Screen.AllScreens)
+        var screens = Screen.AllScreens;
+        foreach (var screen in screens)
         {
             var overlap = Rectangle.Intersect(bounds, screen.WorkingArea);
             visibleArea += (long)overlap.Width * overlap.Height;
         }
         long windowArea = (long)bounds.Width * bounds.Height;
-        return visibleArea * 5 < windowArea * 4; // less than 80% visible
+        if (visibleArea * 5 < windowArea * 4) // less than 80% visible
+            return true;
+
+        // At least a usable top-left caption/drag section must fit on one
+        // current monitor. This catches y=-100 with 85% of a large window
+        // visible. Use effective DPI because the bar scales with its monitor.
+        int headerHeight = Math.Min(bounds.Height,
+            Math.Max(24, UiScale.Px(34, NativeMethods.MonitorDpiAt(bounds))));
+        int grabWidth = Math.Min(bounds.Width, 160);
+        var grab = new Rectangle(bounds.X, bounds.Y, grabWidth, headerHeight);
+        return !screens.Any(s =>
+        {
+            var overlap = Rectangle.Intersect(grab, s.WorkingArea);
+            return overlap.Width >= Math.Min(80, grabWidth)
+                && overlap.Height >= Math.Max(12, headerHeight * 3 / 4);
+        });
     }
+
+    private static Rectangle RecoverAccessibleBounds(Rectangle bounds) =>
+        NeedsOffscreenRecovery(bounds) ? ClampToWorkingArea(bounds) : bounds;
 
     private Rectangle InitialBounds()
     {
         if (settings.WinW > 0 && settings.WinH > 0)
-            return ClampToWorkingArea(new Rectangle(
+            return RecoverAccessibleBounds(new Rectangle(
                 settings.WinX, settings.WinY, settings.WinW, settings.WinH));
 
         var wa = Screen.PrimaryScreen!.WorkingArea;
@@ -364,7 +386,7 @@ public class MainForm : Form
 
     private void ToggleLayoutEditing()
     {
-        if (!calendarInteractionEnabled)
+        if (!calendarInteractionEnabled || isClickThrough)
             return;
 
         // This only reveals the title bar as a drag handle. Browser interaction
@@ -422,7 +444,11 @@ public class MainForm : Form
     private void SetClickThrough(bool enable)
     {
         if (enable)
+        {
+            pendingInteractiveDetach = false; // explicit cancellation of queued interaction
+            ResetDesktopDiscoveryBackoff();
             ReleaseInteractiveDesktopPromotion();
+        }
         isClickThrough = enable;
         previewLook = false;  // widget mode shows the real look; interactive starts opaque again
         if (enable)
@@ -443,11 +469,18 @@ public class MainForm : Form
         {
             if (!DetachFromDesktop())
             {
-                // Never expose interactive input while still a WorkerW child.
+                // Preserve desired interaction; keep input safely click-through
+                // until native parenting succeeds. A bounded watchdog retries
+                // the request without requiring another tray click.
                 isClickThrough = true;
-                calendarInteractionEnabled = false;
+                pendingInteractiveDetach = true;
+                RecordDesktopDiscoveryFailure();
+                hoverPanel.UpdateState(true);
+                titleBar.UpdateState(true, Opacity);
                 return;
             }
+            pendingInteractiveDetach = false;
+            ResetDesktopDiscoveryBackoff();
             styleBurst = 0;
             NativeMethods.DisableClickThrough(clickThroughApplied);
             NativeMethods.RemoveExStyle(Handle, NativeMethods.WS_EX_NOACTIVATE);
@@ -1086,7 +1119,7 @@ public class MainForm : Form
         // changed. Fit the old screen-space rectangle before reparenting.
         Bounds = maximizedBeforeAttach
             ? Screen.FromRectangle(Bounds).WorkingArea
-            : ClampToWorkingArea(Bounds);
+            : RecoverAccessibleBounds(Bounds);
         boundsBeforeAttach = Bounds;
 
         var pt = boundsBeforeAttach.Location;
@@ -1095,7 +1128,7 @@ public class MainForm : Form
             System.Diagnostics.Debug.WriteLine($"WorkerW attach failed, GetLastError={nativeError}");
             if (maximizedBeforeAttach)
             {
-                Bounds = ClampToWorkingArea(normalBoundsBeforeAttach);
+                Bounds = RecoverAccessibleBounds(normalBoundsBeforeAttach);
                 WindowState = FormWindowState.Maximized;
             }
             desktopStateSnapshotValid = false;
@@ -1158,7 +1191,7 @@ public class MainForm : Form
             {
                 if (maximizedBeforeAttach)
                 {
-                    normalBoundsBeforeAttach = ClampToWorkingArea(normalBoundsBeforeAttach);
+                    normalBoundsBeforeAttach = RecoverAccessibleBounds(normalBoundsBeforeAttach);
                     Bounds = normalBoundsBeforeAttach;
                     WindowState = FormWindowState.Maximized;
                 }
@@ -1182,7 +1215,7 @@ public class MainForm : Form
         Bounds = boundsBeforeAttach;
         if (maximizedBeforeAttach)
         {
-            normalBoundsBeforeAttach = ClampToWorkingArea(normalBoundsBeforeAttach);
+            normalBoundsBeforeAttach = RecoverAccessibleBounds(normalBoundsBeforeAttach);
             Bounds = normalBoundsBeforeAttach;  // seed RestoreBounds with the original rect
             WindowState = FormWindowState.Maximized;
         }
@@ -1229,7 +1262,7 @@ public class MainForm : Form
 
         var target = maximizedBeforeAttach
             ? Screen.FromRectangle(boundsBeforeAttach).WorkingArea
-            : ClampToWorkingArea(boundsBeforeAttach);
+            : RecoverAccessibleBounds(boundsBeforeAttach);
         if (!NativeMethods.TryGetWindowRect(Handle, out var actual))
             return;
 
@@ -1303,7 +1336,7 @@ public class MainForm : Form
                 ResetWallpaperZoom();
                 boundsBeforeAttach = maximizedBeforeAttach
                     ? Screen.FromRectangle(boundsBeforeAttach).WorkingArea
-                    : ClampToWorkingArea(boundsBeforeAttach);
+                    : RecoverAccessibleBounds(boundsBeforeAttach);
                 Bounds = boundsBeforeAttach;
             }
             finally
@@ -1317,7 +1350,7 @@ public class MainForm : Form
             // changes during Explorer downtime before retrying attachment.
             boundsBeforeAttach = maximizedBeforeAttach
                 ? Screen.FromRectangle(boundsBeforeAttach).WorkingArea
-                : ClampToWorkingArea(boundsBeforeAttach);
+                : RecoverAccessibleBounds(boundsBeforeAttach);
             if (Bounds != boundsBeforeAttach)
                 Bounds = boundsBeforeAttach;
         }
@@ -1342,7 +1375,7 @@ public class MainForm : Form
         if (!NeedsOffscreenRecovery(normal))
             return;
 
-        var recovered = ClampToWorkingArea(normal);
+        var recovered = RecoverAccessibleBounds(normal);
         if (maximized)
         {
             // WinForms exposes RestoreBounds only as a getter. Change it
@@ -1442,6 +1475,13 @@ public class MainForm : Form
 
     private void CheckMouseHover()
     {
+        // A user request to interact survives failed SetParent(NULL). Retry
+        // with the same exponential backoff used by native WorkerW discovery;
+        // never remove click-through while the HWND remains a shell child.
+        if (pendingInteractiveDetach && calendarInteractionEnabled && isClickThrough &&
+            Environment.TickCount64 >= nextDesktopDiscoveryAt)
+            ApplyInteractionModes();
+
         // Separate foreground handling from the mouse-hover panel.
         if (pendingDemotionForeground != IntPtr.Zero || ++showDesktopPoll >= 10)
         {
@@ -1473,7 +1513,7 @@ public class MainForm : Form
         }
 
         // ~every 1s, make sure we're still behind the icons (the shell can orphan us)
-        if (settings.BehindDesktopIcons && ++attachCheckTick >= 10)
+        if (!pendingInteractiveDetach && settings.BehindDesktopIcons && ++attachCheckTick >= 10)
         {
             attachCheckTick = 0;
             EnsureDesktopAttachment();
@@ -1567,7 +1607,8 @@ public class MainForm : Form
             isLayoutUnlocked = false;
             ApplyInteractionModes();
         }
-        Activate();
+        if (!isClickThrough)
+            Activate();  // never focus a failed-detach WorkerW child
     }
 
     // ---------------- tray + settings ----------------
@@ -1606,9 +1647,11 @@ public class MainForm : Form
             headerItem.Checked = settings.ShowTitleBar;
             behindIconsItem.Checked = settings.BehindDesktopIcons;
             showDesktopItem.Checked = settings.KeepInteractiveVisibleOnDesktop;
-            interactionItem.Checked = calendarInteractionEnabled;
+            interactionItem.Checked = calendarInteractionEnabled;  // desired choice
+            interactionItem.Text = pendingInteractiveDetach
+                ? "Enable calendar interaction (retrying…)" : "Enable calendar interaction";
             layoutItem.Checked = isLayoutUnlocked;
-            layoutItem.Enabled = calendarInteractionEnabled;
+            layoutItem.Enabled = calendarInteractionEnabled && !isClickThrough;
             layoutItem.Text = isLayoutUnlocked ? "Finish moving / resizing" : "Move / resize window";
         };
 
@@ -1625,15 +1668,19 @@ public class MainForm : Form
     private void RefreshTrayIcon()
     {
         var today = DateTime.Today;
+        bool effectivelyInteractive = !isClickThrough;
+        string status = pendingInteractiveDetach
+            ? "Switching to interactive" : effectivelyInteractive ? "Interactive" : "Wallpaper";
+        tray.Text = $"Google Calendar - {today:dd MMM yyyy} - " + status;
         if (renderedTrayIcon is not null
             && renderedTrayDate == today
-            && renderedTrayInteraction == calendarInteractionEnabled)
+            && renderedTrayInteraction == effectivelyInteractive)
             return;
 
         Icon? replacement;
         try
         {
-            replacement = TrayIconRenderer.Create(today.Day, calendarInteractionEnabled);
+            replacement = TrayIconRenderer.Create(today.Day, effectivelyInteractive);
         }
         catch (Exception)
         {
@@ -1644,10 +1691,8 @@ public class MainForm : Form
         var previous = renderedTrayIcon;
         renderedTrayIcon = replacement;
         tray.Icon = replacement;
-        tray.Text = $"Google Calendar - {today:dd MMM yyyy} - "
-            + (calendarInteractionEnabled ? "Interactive" : "Wallpaper");
         renderedTrayDate = today;
-        renderedTrayInteraction = calendarInteractionEnabled;
+        renderedTrayInteraction = effectivelyInteractive;
         previous?.Dispose();
     }
 
