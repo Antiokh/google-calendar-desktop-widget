@@ -44,3 +44,11 @@ Existing Google sign-in and local settings are preserved in `%LOCALAPPDATA%\Cale
 - The target bounds use the nearest current monitor's working area. Maximized wallpapers occupy that work area; normal windows are clamped to usable size and position.
 - If the Explorer WorkerW is missing, window discovery runs via `Task.Run` instead of blocking the WinForms message loop with native timeouts and sleeps. Only one lookup can be in flight; repeated failure backs off exponentially from 2 to 30 seconds. A display-change notification or a user changing the wallpaper setting resets the backoff.
 - The live Settings dialog receives wallpaper setting changes immediately from the tray, with a guard against recursive checkbox callbacks.
+
+### Latest self-review remediation
+
+- **WorkerW parenting:** verify actual `GetAncestor(GA_PARENT)` after every `SetParent` (including detach and orphan recovery). Do not flip app state when the native parent did not change. Failed detach keeps interaction disabled until top-level ancestry is confirmed.
+- **WebView2 zoom:** reset to 100% on normal or orphaned detach; reconcile physical monitor DPI against inherited WorkerW DPI on attachment and while checking monitor geometry.
+- **Rapid Win+D:** the next foreground transition into Explorer's desktop resets suppression left over from an earlier Restore All.
+- **Layout lock:** when Move / resize is unchecked, disable both the title bar's drag/double-click actions and native border/caption hit testing for moving and resizing. Calendar interaction remains enabled.
+- **CI:** Windows publish verifies compilation only. Actual parent transitions, mixed-DPI scaling, Explorer restarts, and Show Desktop gestures require on-device verification.

@@ -672,7 +672,8 @@ public class MainForm : Form
             {
                 // Native WS_THICKFRAME can produce resize hits even without
                 // the custom padding grips. Suppress both while locked.
-                if ((int)m.Result is NativeMethods.HTLEFT or NativeMethods.HTRIGHT
+                if ((int)m.Result is NativeMethods.HTCAPTION
+                    or NativeMethods.HTLEFT or NativeMethods.HTRIGHT
                     or NativeMethods.HTTOP or NativeMethods.HTBOTTOM
                     or NativeMethods.HTTOPLEFT or NativeMethods.HTTOPRIGHT
                     or NativeMethods.HTBOTTOMLEFT or NativeMethods.HTBOTTOMRIGHT)

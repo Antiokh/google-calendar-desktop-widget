@@ -267,6 +267,7 @@ internal static class NativeMethods
     public const int WM_NCCALCSIZE = 0x83;
     public const int WM_GETMINMAXINFO = 0x24;
     public const int HTCLIENT = 1;
+    public const int HTCAPTION = 2;
     public const uint SWP_NOZORDER_NOACTIVATE = 0x0014;
 
     [StructLayout(LayoutKind.Sequential)]
