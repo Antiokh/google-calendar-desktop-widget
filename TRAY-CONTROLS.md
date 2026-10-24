@@ -68,3 +68,11 @@ Existing Google sign-in and local settings are preserved in `%LOCALAPPDATA%\Cale
 - A normal window deliberately spanning two screens is kept in place when it remains mostly visible **and** its grab strip is accessible, consistently at startup, WorkerW attach/recovery and while top-level.
 - A transient native detach failure no longer discards the user's request for calendar interaction. The desired setting remains checked, while actual click-through input is retained until verified top-level parenting. The existing 100 ms timer retries only when the shared 2–30 s native backoff allows it. Clicking the interaction toggle again cancels that request.
 - The tray icon represents **effective** interaction mode; the menu says `retrying…` while activation is pending. Sign-in does not activate a WorkerW child until detach succeeds. No new timer or thread is added.
+
+
+### Follow-up self-review: Z-order, system commands and attachment conversion
+
+- Releasing temporary TOPMOST due to `MINIMIZEEND` still uses only `HWND_NOTOPMOST` (the established flicker fix). On a stable foreground switch to an ordinary application, the calendar additionally inserts **below that foreground HWND**, avoiding `HWND_NOTOPMOST` placing it above all non-topmost windows. Never unconditionally use `HWND_BOTTOM` on a reverse Win+D.
+- `Move / resize window` also blocks native `WM_SYSCOMMAND` move, size and maximize (plus restore-from-maximized) when locked, while allowing restore from minimization for Explorer gestures. Programmatic display/DPI geometry changes are not intercepted.
+- A change between desktop and non-desktop foreground resets the `MINIMIZEEND` burst detector; restoration candidates cannot leak into another desktop activation episode.
+- Both initial and delayed `ScreenToClient` calculations are checked, and the delayed handler revalidates the native parent. Failure skips the unsafe `SetWindowPos` and leaves recovery to the existing WorkerW watchdog.

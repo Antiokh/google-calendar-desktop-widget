@@ -523,10 +523,7 @@ public class MainForm : Form
             {
                 long now = Environment.TickCount64;
                 if (now > restoreBurstDeadline)
-                {
-                    restoreBurstCount = 0;
-                    lastRestoreCandidate = IntPtr.Zero;
-                }
+                    ResetRestoreBurst();
                 restoreBurstDeadline = now + 350;
                 if (hwnd != lastRestoreCandidate)
                 {
@@ -535,7 +532,7 @@ public class MainForm : Form
                 }
                 if (restoreBurstCount >= 2)
                 {
-                    restoreBurstCount = 0;
+                    ResetRestoreBurst();
                     restoreTransitionUntil = now + 1200;
                     ReleaseInteractiveDesktopPromotion();
                 }
@@ -547,6 +544,10 @@ public class MainForm : Form
         {
             bool desktopNow = NativeMethods.IsDesktopForeground(hwnd);
             bool desktopPreviously = NativeMethods.IsDesktopForeground(lastForegroundEventWindow);
+            // Only events within the *same* desktop foreground episode may
+            // contribute to a two-window Restore All burst.
+            if (desktopNow != desktopPreviously)
+                ResetRestoreBurst();
             if (desktopNow && !desktopPreviously && lastForegroundEventWindow != IntPtr.Zero)
             {
                 // A new Win+D can arrive immediately after an earlier restore.
@@ -572,6 +573,13 @@ public class MainForm : Form
     {
         pendingDemotionForeground = IntPtr.Zero;
         pendingDemotionStartedAt = 0;
+    }
+
+    private void ResetRestoreBurst()
+    {
+        restoreBurstCount = 0;
+        lastRestoreCandidate = IntPtr.Zero;
+        restoreBurstDeadline = 0;
     }
 
     /// <summary>
@@ -650,7 +658,7 @@ public class MainForm : Form
             // while Windows is still animating the restoration of other windows.
             if (now - pendingDemotionStartedAt >= ForegroundSettleMs)
             {
-                ReleaseInteractiveDesktopPromotion();
+                ReleaseInteractiveDesktopPromotion(foreground);
                 CancelPendingDesktopDemotion();
             }
         }
@@ -660,7 +668,7 @@ public class MainForm : Form
         }
     }
 
-    private void ReleaseInteractiveDesktopPromotion()
+    private void ReleaseInteractiveDesktopPromotion(IntPtr stableAppForeground = default)
     {
         CancelPendingDesktopDemotion();
         if (!IsHandleCreated)
@@ -676,13 +684,29 @@ public class MainForm : Form
             return;
         }
 
-        // Only clear TOPMOST. HWND_BOTTOM also pushes the calendar behind
-        // every ordinary window, which can cause a visible frame during the
-        // reverse Show Desktop gesture. Let Explorer restore the normal order.
-        // Ignore failure; the watchdog will reconcile the native state again.
-        if (NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_NOTOPMOST,
+        // Keep the proven reverse-Win+D behavior: never force HWND_BOTTOM.
+        // HWND_NOTOPMOST alone raises us to the top of the *ordinary* band,
+        // however. On a confirmed ordinary app switch, position the widget
+        // below the foreground app after removing its TOPMOST status.
+        if (!NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_NOTOPMOST,
                 0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE))
-            interactiveDesktopTopmost = NativeMethods.IsTopmost(Handle);
+            return;
+        interactiveDesktopTopmost = NativeMethods.IsTopmost(Handle);
+        if (interactiveDesktopTopmost)
+            return;
+
+        // MINIMIZEEND/desktop restore calls this without an app argument:
+        // the extra reorder would revive the previously fixed flicker.
+        // A topmost foreground app already stands above every normal window.
+        if (stableAppForeground != IntPtr.Zero && stableAppForeground != Handle &&
+            NativeMethods.IsWindow(stableAppForeground) &&
+            !NativeMethods.IsDesktopForeground(stableAppForeground) &&
+            !NativeMethods.IsTopmost(stableAppForeground))
+        {
+            if (!NativeMethods.SetWindowPos(Handle, stableAppForeground,
+                    0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE))
+                System.Diagnostics.Debug.WriteLine("Could not place calendar below foreground window");
+        }
     }
 
     // pin the window to the bottom of the Z-order: any attempt to raise it
@@ -695,6 +719,23 @@ public class MainForm : Form
             wp.hwndInsertAfter = NativeMethods.HWND_BOTTOM;
             wp.flags &= ~NativeMethods.SWP_NOZORDER;
             Marshal.StructureToPtr(wp, m.LParam, false);
+        }
+
+        // The mouse hit-test is not the only layout entry point: Alt+Space,
+        // keyboard shortcuts, and system-menu actions can issue WM_SYSCOMMAND
+        // directly. Permit shell un-minimize/restore of an iconic window (Win+D
+        // and Win+Shift+M), but block user move/size/maximize while locked.
+        if (m.Msg == NativeMethods.WM_SYSCOMMAND && !isClickThrough && !isLayoutUnlocked)
+        {
+            int command = unchecked((int)(m.WParam.ToInt64() & 0xFFF0));
+            if (command is NativeMethods.SC_MOVE or NativeMethods.SC_SIZE
+                or NativeMethods.SC_MAXIMIZE ||
+                (command == NativeMethods.SC_RESTORE &&
+                 !NativeMethods.IsIconic(Handle) && NativeMethods.IsZoomed(Handle)))
+            {
+                m.Result = IntPtr.Zero;
+                return;
+            }
         }
 
         // claim the caption/frame area as client: removes the native title bar visuals
@@ -1136,12 +1177,20 @@ public class MainForm : Form
             FinishReparentTransition(generation);
             return false;
         }
-        NativeMethods.ScreenToClient(workerW, ref pt);  // child coordinates are WorkerW-relative
+        attachedToDesktop = true;  // native parent already verified
+        attachedWorkerW = workerW;
+        if (!NativeMethods.ScreenToClient(workerW, ref pt))
+        {
+            // Explorer may destroy/reparent WorkerW between SetParent and the
+            // coordinate conversion. Never pass absolute screen coordinates
+            // to a child-relative SetWindowPos; the watchdog will recover.
+            System.Diagnostics.Debug.WriteLine("WorkerW attach: ScreenToClient failed; watchdog will reconcile");
+            FinishReparentTransition(generation);
+            return true;
+        }
         if (!NativeMethods.SetWindowPos(Handle, IntPtr.Zero, pt.X, pt.Y,
                 boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE))
             System.Diagnostics.Debug.WriteLine("WorkerW attach: initial SetWindowPos failed; watchdog will retry");
-        attachedToDesktop = true;
-        attachedWorkerW = workerW;
         EnsureStripBackdrop();  // the painted strip is invisible from here on
 
         // reparenting swaps the DPI context to the primary monitor's: WebView2 re-zooms
@@ -1160,7 +1209,13 @@ public class MainForm : Form
                         return;
                     UpdateWallpaperZoom();
                     var p2 = boundsBeforeAttach.Location;
-                    NativeMethods.ScreenToClient(workerW, ref p2);
+                    if (!NativeMethods.IsWorkerW(workerW) ||
+                        !NativeMethods.HasParent(Handle, workerW) ||
+                        !NativeMethods.ScreenToClient(workerW, ref p2))
+                    {
+                        System.Diagnostics.Debug.WriteLine("WorkerW attach: delayed ScreenToClient failed; watchdog will reconcile");
+                        return;
+                    }
                     if (!NativeMethods.SetWindowPos(Handle, IntPtr.Zero, p2.X, p2.Y,
                             boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE))
                         System.Diagnostics.Debug.WriteLine("WorkerW attach: delayed SetWindowPos failed; watchdog will retry");
