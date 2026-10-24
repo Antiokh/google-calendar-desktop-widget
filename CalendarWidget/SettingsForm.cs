@@ -27,6 +27,7 @@ public class SettingsForm : Form
     private readonly Label valAlpha = ValueLabel(ContentAlignment.TopRight);
     private readonly TrackBar sldAlpha;
     private readonly CheckBox cbBehind;
+    private bool syncingBehindDesktopIcons;
     private readonly Label lblShadow = SectionLabel("EDGE SHADOWS");
     private readonly EdgeShadowSlider sldShadow;
     private readonly Label valShadowLeft = ValueLabel(ContentAlignment.TopLeft);
@@ -84,7 +85,11 @@ public class SettingsForm : Form
 
         // ---- live-wallpaper mode ----
         cbBehind = Check("Sit behind desktop icons (live wallpaper)", settings.BehindDesktopIcons);
-        cbBehind.CheckedChanged += (_, _) => main.SetBehindDesktopIcons(cbBehind.Checked);
+        cbBehind.CheckedChanged += (_, _) =>
+        {
+            if (!syncingBehindDesktopIcons)
+                main.SetBehindDesktopIcons(cbBehind.Checked);
+        };
 
         // ---- edge shadows: dark fades behind desktop icons ----
         sldShadow = new EdgeShadowSlider
@@ -254,15 +259,25 @@ public class SettingsForm : Form
         Location = e.SuggestedRectangle.Location;
     }
 
+    /// <summary>
+    /// Update the Settings checkbox when changed from the tray, including
+    /// while this dialog is open, without echoing a CheckedChanged write.
+    /// </summary>
+    public void SyncBehindDesktopIcons(bool behind)
+    {
+        if (IsDisposed || cbBehind.Checked == behind)
+            return;
+        syncingBehindDesktopIcons = true;
+        try { cbBehind.Checked = behind; }
+        finally { syncingBehindDesktopIcons = false; }
+    }
+
     protected override void OnVisibleChanged(EventArgs e)
     {
         base.OnVisibleChanged(e);
         if (Visible)
         {
-            // The tray menu can change this setting while Settings is closed.
-            // Keep the two entry points synchronized when the dialog reopens.
-            if (cbBehind.Checked != settings.BehindDesktopIcons)
-                cbBehind.Checked = settings.BehindDesktopIcons;
+            SyncBehindDesktopIcons(settings.BehindDesktopIcons);
             RefreshAccountButton();
         }
         else

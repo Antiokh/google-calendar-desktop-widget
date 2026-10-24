@@ -36,3 +36,11 @@ dotnet publish CalendarWidget/CalendarWidget.csproj -c Release -r win-x64 --self
 GitHub Actions runs on pull requests, on merges/pushes to `main`, and manually. The uploaded artifact is `calendar-widget-tray-win-x64`. Exit the running widget before starting another build because they share a single-instance mutex.
 
 Existing Google sign-in and local settings are preserved in `%LOCALAPPDATA%\CalendarWidget`. Runtime behaviors that require manual verification: reverse Win+D and touchpad gestures; ordinary app restore; WorkerW destruction/Explorer restart; hot-plugging and DPI mismatches; maximized/normal round-trips; Google login persistence. Successful compilation alone does not validate these Windows-shell scenarios.
+
+
+### Multi-monitor recovery and nonblocking WorkerW discovery
+
+- The one-second watchdog now reconciles **screen-space geometry even while the same WorkerW is alive**, so disconnecting a monitor cannot leave the calendar parked offscreen indefinitely.
+- The target bounds use the nearest current monitor's working area. Maximized wallpapers occupy that work area; normal windows are clamped to usable size and position.
+- If the Explorer WorkerW is missing, window discovery runs via `Task.Run` instead of blocking the WinForms message loop with native timeouts and sleeps. Only one lookup can be in flight; repeated failure backs off exponentially from 2 to 30 seconds. A display-change notification or a user changing the wallpaper setting resets the backoff.
+- The live Settings dialog receives wallpaper setting changes immediately from the tray, with a guard against recursive checkbox callbacks.
