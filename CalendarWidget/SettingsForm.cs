@@ -21,6 +21,7 @@ public class SettingsForm : Form
     private const int Gutter = 20;         // left/right margin
 
     private readonly MainForm main;
+    private readonly AppSettings settings;
 
     private readonly Label lblAlpha = SectionLabel("TRANSPARENCY");
     private readonly Label valAlpha = ValueLabel(ContentAlignment.TopRight);
@@ -52,6 +53,7 @@ public class SettingsForm : Form
     public SettingsForm(MainForm main, AppSettings settings)
     {
         this.main = main;
+        this.settings = settings;
         Text = "Google Calendar Desktop Widget";
         AutoScaleMode = AutoScaleMode.None;  // LayoutForDpi scales everything itself
         FormBorderStyle = FormBorderStyle.FixedDialog;
