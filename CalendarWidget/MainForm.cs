@@ -164,11 +164,11 @@ public class MainForm : Form
             // Fit an existing window to the usable working area, not merely a
             // 64x64 intersection; even with the header hidden the resize edges
             // must remain accessible.
-            int w = Math.Clamp(saved.Width, Math.Min(320, work.Width), work.Width);
-            int h = Math.Clamp(saved.Height, Math.Min(200, work.Height), work.Height);
-            int x = Math.Clamp(saved.X, work.Left, work.Right - w);
-            int y = Math.Clamp(saved.Y, work.Top, work.Bottom - h);
-            return new Rectangle(x, y, w, h);
+            int visibleWidth = Math.Clamp(saved.Width, Math.Min(320, work.Width), work.Width);
+            int visibleHeight = Math.Clamp(saved.Height, Math.Min(200, work.Height), work.Height);
+            int x = Math.Clamp(saved.X, work.Left, work.Right - visibleWidth);
+            int y = Math.Clamp(saved.Y, work.Top, work.Bottom - visibleHeight);
+            return new Rectangle(x, y, visibleWidth, visibleHeight);
         }
 
         var wa = Screen.PrimaryScreen!.WorkingArea;
