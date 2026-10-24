@@ -559,9 +559,12 @@ public class MainForm : Form
             return;
         }
 
-        // HWND_BOTTOM clears TOPMOST and restores bottom Z-order in a single
-        // native operation. Ignore a failed call; the watchdog can retry it.
-        if (NativeMethods.SendToBottom(Handle))
+        // Only clear TOPMOST. HWND_BOTTOM also pushes the calendar behind
+        // every ordinary window, which can cause a visible frame during the
+        // reverse Show Desktop gesture. Let Explorer restore the normal order.
+        // Ignore failure; the watchdog will reconcile the native state again.
+        if (NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_NOTOPMOST,
+                0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE))
             interactiveDesktopTopmost = NativeMethods.IsTopmost(Handle);
     }
 

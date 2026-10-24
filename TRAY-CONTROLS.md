@@ -65,3 +65,9 @@ Note: on taskbars that display tray icons at only 16×16, the date is prioritize
 - For up to 1.2 seconds while Explorer settles, skip any re-promotion triggered by the still-active desktop HWND. Other restored windows naturally take focus and the calendar stays under them.
 - Retain the foreground-event watcher and 1-second native-state watchdog: no `MINIMIZEEND` is generated when no minimizable windows are open. This also covers taskbar gestures and unusual shell implementations.
 - The test build must be verified on Windows: some gestures may deliver `MINIMIZEEND` at slightly different moments, and Explorer can still paint a transitional frame.
+
+### Reverse Show Desktop Z-order experiment
+
+- On exit from the temporary Show Desktop promotion, call `SetWindowPos(HWND_NOTOPMOST)` instead of `HWND_BOTTOM`. This removes the topmost bit without forcing the calendar below every other ordinary window during Explorer's restore animation.
+- Keep `SendToBottom` for actual click-through/wallpaper mode only. All foreground and minimize-end event handling and the fallback watchdog remain unchanged.
+- Experiment: test reverse Win+D/trackpad gesture and normal app switching. HWND_NOTOPMOST places the window at the top of the **non-topmost** band, so if it covers a restored application briefly, that observation informs the next fix.
