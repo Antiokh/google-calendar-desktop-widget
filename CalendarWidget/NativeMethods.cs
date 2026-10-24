@@ -15,6 +15,7 @@ internal static class NativeMethods
     public const long WS_EX_TOPMOST = 0x00000008;     // actual topmost state, not our cached flag
     public const int WS_MINIMIZEBOX = 0x00020000;
     public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    public const uint EVENT_SYSTEM_MINIMIZEEND = 0x0017; // a window is about to be restored
     public const uint WINEVENT_OUTOFCONTEXT = 0;
 
     public const int WM_WINDOWPOSCHANGING = 0x0046;

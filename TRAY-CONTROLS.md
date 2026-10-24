@@ -56,3 +56,12 @@ Note: on taskbars that display tray icons at only 16×16, the date is prioritize
 - On returning from Show Desktop, wait until the same non-desktop foreground window remains stable for ~180 ms before dropping temporary `TOPMOST` status. The existing 100 ms timer completes this transition even if there is no second foreground event.
 - Promotion retries are limited to once per second if Explorer repeatedly overrides Z-order; safety checks retain a once-per-second cadence.
 - This addresses a plausible source of reverse-gesture flicker (premature `HWND_BOTTOM`), but Windows shell animations can still briefly cover the widget on some configurations. Please test Win+D, taskbar Show Desktop, trackpad reverse gesture, and switching to regular applications.
+
+
+### Early restore-all approximation (Win+D reverse gesture)
+
+- Windows does not expose a dedicated global `Restore All` WinEvent; it does send `EVENT_SYSTEM_MINIMIZEEND` **before each individual window is restored**.
+- When the calendar was temporarily promoted above the desktop and another app starts restoring, immediately remove its topmost state via one `HWND_BOTTOM` operation, rather than waiting for foreground activation and the 180 ms debounce.
+- For up to 1.2 seconds while Explorer settles, skip any re-promotion triggered by the still-active desktop HWND. Other restored windows naturally take focus and the calendar stays under them.
+- Retain the foreground-event watcher and 1-second native-state watchdog: no `MINIMIZEEND` is generated when no minimizable windows are open. This also covers taskbar gestures and unusual shell implementations.
+- The test build must be verified on Windows: some gestures may deliver `MINIMIZEEND` at slightly different moments, and Explorer can still paint a transitional frame.

@@ -57,8 +57,12 @@ public class MainForm : Form
     private IntPtr pendingDemotionForeground;
     private long pendingDemotionStartedAt;
     private long nextPromotionAttemptAt;
+    // Restore events fire before the restored windows finish appearing. Suppress
+    // a fresh desktop promotion while Explorer is completing the reverse gesture.
+    private long restoreTransitionUntil;
     private readonly NativeMethods.WinEventProc foregroundCallback;
     private IntPtr foregroundHook;
+    private IntPtr restoreHook;
     private Rectangle normalBoundsBeforeAttach;  // the pre-maximize rect to give back to RestoreBounds
     private readonly HashSet<IntPtr> clickThroughApplied = [];  // windows WE made transparent
 
@@ -256,6 +260,14 @@ public class MainForm : Form
             NativeMethods.EVENT_SYSTEM_FOREGROUND,
             IntPtr.Zero, foregroundCallback, 0, 0,
             NativeMethods.WINEVENT_OUTOFCONTEXT);
+        // There is no WinEvent for "Restore All" as a batch. The first
+        // MINIMIZEEND from an ordinary window is an early signal that Explorer
+        // is restoring windows after Show Desktop.
+        restoreHook = NativeMethods.SetWinEventHook(
+            NativeMethods.EVENT_SYSTEM_MINIMIZEEND,
+            NativeMethods.EVENT_SYSTEM_MINIMIZEEND,
+            IntPtr.Zero, foregroundCallback, 0, 0,
+            NativeMethods.WINEVENT_OUTOFCONTEXT);
 
         // Restore the previous screen and maximized state before attaching to
         // WorkerW, so its working-area geometry is computed from the right monitor.
@@ -403,18 +415,34 @@ public class MainForm : Form
     }
 
     /// <summary>
-    /// An event triggers the first reconciliation promptly; the existing hover
-    /// timer provides a low-cost one-second watchdog and drives a short,
-    /// stable-foreground cooldown on the *reverse* Show Desktop gesture.
+    /// Foreground changes drive regular reconciliation. A window's MINIMIZEEND
+    /// is an earlier, window-level approximation of "Restore All": remove
+    /// temporary TOPMOST *before* Explorer renders the restored windows.
+    /// The one-second polling fallback also covers gestures that restore none.
     /// </summary>
     private void OnForegroundWindowChanged(
         IntPtr hook, uint eventType, IntPtr hwnd,
         int idObject, int idChild, uint eventThread, uint eventTime)
     {
-        if (eventType != NativeMethods.EVENT_SYSTEM_FOREGROUND ||
-            idObject != 0 || idChild != 0 || IsDisposed || Disposing)
+        if (idObject != 0 || idChild != 0 || IsDisposed || Disposing)
             return;
-        MaintainInteractiveDesktopVisibility();
+
+        if (eventType == NativeMethods.EVENT_SYSTEM_MINIMIZEEND)
+        {
+            if (hwnd != IntPtr.Zero && hwnd != Handle && !isClickThrough &&
+                settings.KeepInteractiveVisibleOnDesktop && IsHandleCreated &&
+                NativeMethods.IsTopmost(Handle))
+            {
+                // Keep Explorer's reverse transition from triggering a new
+                // topmost promotion while the foreground is still desktop.
+                restoreTransitionUntil = Environment.TickCount64 + 1200;
+                ReleaseInteractiveDesktopPromotion();
+            }
+            return;
+        }
+
+        if (eventType == NativeMethods.EVENT_SYSTEM_FOREGROUND)
+            MaintainInteractiveDesktopVisibility();
     }
 
     private bool IsOurForegroundWindow(IntPtr hwnd) =>
@@ -464,8 +492,8 @@ public class MainForm : Form
                 }
 
                 interactiveDesktopTopmost = false;
-                if (now < nextPromotionAttemptAt)
-                    return;  // avoid repeated Z-order battles with Explorer
+                if (now < nextPromotionAttemptAt || now < restoreTransitionUntil)
+                    return;  // avoid fighting Explorer during window restoration
 
                 nextPromotionAttemptAt = now + PromotionRetryMs;
                 if (NativeMethods.IsIconic(Handle))
@@ -1226,6 +1254,11 @@ public class MainForm : Form
         {
             NativeMethods.UnhookWinEvent(foregroundHook);
             foregroundHook = IntPtr.Zero;
+        }
+        if (restoreHook != IntPtr.Zero)
+        {
+            NativeMethods.UnhookWinEvent(restoreHook);
+            restoreHook = IntPtr.Zero;
         }
         hoverPoll.Stop();
         ReleaseInteractiveDesktopPromotion();
