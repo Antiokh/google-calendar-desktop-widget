@@ -48,6 +48,8 @@ public class MainForm : Form
     // Desired calendar interaction survives a transient native detach failure.
     // The actual OS click-through state stays enabled until detach succeeds.
     private bool pendingInteractiveDetach;
+    // Preserve an explicit wallpaper-disable request across SetParent errors.
+    private bool pendingWallpaperDetach;
     private bool attachedToDesktop;       // reparented into WorkerW (behind the desktop icons)
     private IntPtr attachedWorkerW;       // the specific WorkerW we parented into; its destruction = orphaned
     private Rectangle boundsBeforeAttach; // screen bounds to restore on detach (child coords are parent-relative)
@@ -446,6 +448,8 @@ public class MainForm : Form
         if (enable)
         {
             pendingInteractiveDetach = false; // explicit cancellation of queued interaction
+            if (!settings.BehindDesktopIcons && attachedToDesktop)
+                pendingWallpaperDetach = true; // still need to leave WorkerW
             ResetDesktopDiscoveryBackoff();
             ReleaseInteractiveDesktopPromotion();
         }
@@ -480,6 +484,7 @@ public class MainForm : Form
                 return;
             }
             pendingInteractiveDetach = false;
+            pendingWallpaperDetach = false; // native detach also satisfied wallpaper OFF
             ResetDesktopDiscoveryBackoff();
             styleBurst = 0;
             NativeMethods.DisableClickThrough(clickThroughApplied);
@@ -697,15 +702,20 @@ public class MainForm : Form
 
         // MINIMIZEEND/desktop restore calls this without an app argument:
         // the extra reorder would revive the previously fixed flicker.
-        // A topmost foreground app already stands above every normal window.
+        // An owned modal dialog sits above its application's root owner.
+        // Position below that owner, not between the dialog and main window.
+        // Reverse Win+D still calls this method without an app HWND.
         if (stableAppForeground != IntPtr.Zero && stableAppForeground != Handle &&
             NativeMethods.IsWindow(stableAppForeground) &&
             !NativeMethods.IsDesktopForeground(stableAppForeground) &&
             !NativeMethods.IsTopmost(stableAppForeground))
         {
-            if (!NativeMethods.SetWindowPos(Handle, stableAppForeground,
+            IntPtr rootOwner = NativeMethods.RootOwner(stableAppForeground);
+            IntPtr anchor = rootOwner != IntPtr.Zero && rootOwner != Handle &&
+                !NativeMethods.IsTopmost(rootOwner) ? rootOwner : stableAppForeground;
+            if (!NativeMethods.SetWindowPos(Handle, anchor,
                     0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE))
-                System.Diagnostics.Debug.WriteLine("Could not place calendar below foreground window");
+                System.Diagnostics.Debug.WriteLine("Could not place calendar below foreground app owner");
         }
     }
 
@@ -1456,9 +1466,39 @@ public class MainForm : Form
     /// </summary>
     private void ReconcileUnattachedWallpaperFallback()
     {
-        if (!attachedToDesktop && !desktopStateSnapshotValid &&
-            !reparentInProgress && !desktopDiscoveryInFlight)
+        if (attachedToDesktop || reparentInProgress || desktopDiscoveryInFlight)
+            return;
+
+        if (!desktopStateSnapshotValid)
+        {
             ReconcileTopLevelGeometry();
+            return;
+        }
+
+        // A destroyed WorkerW leaves a top-level HWND yet the wallpaper
+        // maximize/restore snapshot intentionally stays valid. The regular
+        // top-level method skips it to avoid persisting temporary bounds.
+        // Reconcile here without discarding that snapshot.
+        if (WindowState == FormWindowState.Minimized)
+            return;
+
+        if (maximizedBeforeAttach)
+        {
+            var work = Screen.FromRectangle(boundsBeforeAttach).WorkingArea;
+            normalBoundsBeforeAttach = RecoverAccessibleBounds(normalBoundsBeforeAttach);
+            if (Bounds != work)
+                Bounds = work;
+            boundsBeforeAttach = work;
+        }
+        else
+        {
+            // Prefer the actual window location when Windows has already moved
+            // it successfully to the remaining monitors.
+            if (NeedsOffscreenRecovery(Bounds))
+                Bounds = RecoverAccessibleBounds(Bounds);
+            if (NeedsOffscreenRecovery(boundsBeforeAttach) || boundsBeforeAttach != Bounds)
+                boundsBeforeAttach = Bounds;
+        }
     }
 
     private void ReconcileDisplayConfiguration()
@@ -1474,29 +1514,42 @@ public class MainForm : Form
             ReconcileTopLevelGeometry();
     }
 
+    /// <summary>
+    /// Retry the requested wallpaper disable after a transient native failure.
+    /// Keep click-through enabled until we have verified top-level parenting.
+    /// </summary>
+    private void RetryPendingWallpaperDetach()
+    {
+        if (!pendingWallpaperDetach || settings.BehindDesktopIcons ||
+            !isClickThrough || pendingInteractiveDetach)
+            return;
+        if (!DetachFromDesktop())
+        {
+            RecordDesktopDiscoveryFailure();
+            return;
+        }
+        pendingWallpaperDetach = false;
+        ResetDesktopDiscoveryBackoff();
+        NativeMethods.SendToBottom(Handle);
+    }
+
     public void SetBehindDesktopIcons(bool behind)
     {
-        settings.BehindDesktopIcons = behind;
+        settings.BehindDesktopIcons = behind; // desired mode, regardless of native outcome
+        pendingWallpaperDetach = false; // explicit user toggle supersedes prior request
         ResetDesktopDiscoveryBackoff();
-        // Tray toggles must also update an already-open settings dialog.
         settingsForm?.SyncBehindDesktopIcons(behind);
         if (isClickThrough)
         {
             if (behind)
-            {
                 AttachToDesktop();
+            else if (attachedToDesktop && !DetachFromDesktop())
+            {
+                pendingWallpaperDetach = true;
+                RecordDesktopDiscoveryFailure();
             }
             else
-            {
-                if (DetachFromDesktop())
-                    NativeMethods.SendToBottom(Handle);
-                else
-                {
-                    // Preserve the actual wallpaper state after native failure.
-                    settings.BehindDesktopIcons = true;
-                    settingsForm?.SyncBehindDesktopIcons(true);
-                }
-            }
+                NativeMethods.SendToBottom(Handle);
         }
         settings.Save();
     }
@@ -1553,6 +1606,9 @@ public class MainForm : Form
         if (pendingInteractiveDetach && calendarInteractionEnabled && isClickThrough &&
             Environment.TickCount64 >= nextDesktopDiscoveryAt)
             ApplyInteractionModes();
+        else if (pendingWallpaperDetach && isClickThrough &&
+                 Environment.TickCount64 >= nextDesktopDiscoveryAt)
+            RetryPendingWallpaperDetach();
 
         // Separate foreground handling from the mouse-hover panel.
         if (pendingDemotionForeground != IntPtr.Zero || ++showDesktopPoll >= 10)
@@ -1587,7 +1643,8 @@ public class MainForm : Form
         }
 
         // ~every 1s, make sure we're still behind the icons (the shell can orphan us)
-        if (!pendingInteractiveDetach && settings.BehindDesktopIcons && ++attachCheckTick >= 10)
+        if (!pendingInteractiveDetach && !pendingWallpaperDetach &&
+            settings.BehindDesktopIcons && ++attachCheckTick >= 10)
         {
             attachCheckTick = 0;
             EnsureDesktopAttachment();
@@ -1720,6 +1777,8 @@ public class MainForm : Form
         {
             headerItem.Checked = settings.ShowTitleBar;
             behindIconsItem.Checked = settings.BehindDesktopIcons;
+            behindIconsItem.Text = pendingWallpaperDetach
+                ? "Behind desktop icons (disabling…)" : "Behind desktop icons (live wallpaper)";
             showDesktopItem.Checked = settings.KeepInteractiveVisibleOnDesktop;
             interactionItem.Checked = calendarInteractionEnabled;  // desired choice
             interactionItem.Text = pendingInteractiveDetach

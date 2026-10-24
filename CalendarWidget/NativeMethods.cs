@@ -121,6 +121,7 @@ internal static class NativeMethods
     public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
 
     private const uint GA_PARENT = 1;
+    private const uint GA_ROOTOWNER = 3;
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
@@ -144,6 +145,18 @@ internal static class NativeMethods
 
     public static bool HasParent(IntPtr child, IntPtr parent) =>
         GetAncestor(child, GA_PARENT) == parent;
+
+    /// <summary>
+    /// Resolve a modal popup to its root owning application window so the
+    /// desktop widget cannot end up between a dialog and its main window.
+    /// </summary>
+    public static IntPtr RootOwner(IntPtr hwnd)
+    {
+        if (!IsWindow(hwnd))
+            return IntPtr.Zero;
+        IntPtr root = GetAncestor(hwnd, GA_ROOTOWNER);
+        return root != IntPtr.Zero && IsWindow(root) ? root : hwnd;
+    }
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetParent(IntPtr hWnd);

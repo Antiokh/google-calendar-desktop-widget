@@ -82,3 +82,10 @@ Existing Google sign-in and local settings are preserved in `%LOCALAPPDATA%\Cale
 
 - When wallpaper is requested but no WorkerW has yet been found, the widget is still a top-level window. Display-change handling and the existing once-per-second geometry watchdog now recover this fallback if it becomes inaccessible after monitor removal. Reconciliation is skipped during an asynchronous discovery or active reparent, and does not treat a healthy attached WorkerW as a top-level window.
 - After verified native WorkerW parenting, title-strip backdrop initialization now occurs **before** the first screen-to-client coordinate conversion. If that conversion fails and the recovery watchdog must take over, the decorative strip is not silently skipped. Startup still retries when the embedded WebView2 environment becomes available.
+
+
+### Orphaned wallpaper recovery and deferred disable
+
+- On Explorer/WorkerW loss, the actual top-level fallback now reconciles screen geometry while its original wallpaper maximize/restore snapshot is still valid. Original restore bounds remain available on later detach.
+- Disabling live wallpaper persists as a desired setting even if SetParent(NULL) fails. The existing 2–30 second native retry gate eventually detaches the widget while preserving safe click-through until native ancestry is confirmed. Settings stays unchecked, and the tray shows 'disabling…' while pending.
+- Stable switches to applications with modal dialogs place the calendar below the application's root owner (GA_ROOTOWNER), preventing it from sitting between the popup and main window. The proven reverse Win+D path continues to use HWND_NOTOPMOST alone.
