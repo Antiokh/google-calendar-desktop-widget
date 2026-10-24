@@ -22,6 +22,31 @@ jobs:
           dotnet-version: '8.0.x'
       - name: Publish Windows x64
         run: dotnet publish CalendarWidget/CalendarWidget.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
+      - name: Remove duplicate WebView2Loader.dll from runtime subfolder
+        shell: pwsh
+        run: |
+          # WebView2's NuGet targets can publish the same native x64 loader
+          # both beside the EXE and under runtimes/win-x64/native. Keep the
+          # root copy needed for loading, and only drop an identical duplicate.
+          $root = Join-Path "publish" "WebView2Loader.dll"
+          $duplicate = Join-Path "publish" "runtimes/win-x64/native/WebView2Loader.dll"
+          if ((Test-Path $root) -and (Test-Path $duplicate)) {
+            $rootHash = (Get-FileHash $root -Algorithm SHA256).Hash
+            $duplicateHash = (Get-FileHash $duplicate -Algorithm SHA256).Hash
+            if ($rootHash -ne $duplicateHash) {
+              throw "Different WebView2Loader.dll binaries: refusing to remove either copy"
+            }
+            Remove-Item $duplicate
+            Remove-Item (Split-Path $duplicate) -Force
+            Remove-Item (Split-Path (Split-Path $duplicate)) -Force
+            Remove-Item (Split-Path (Split-Path (Split-Path $duplicate))) -Force
+            Write-Host "Removed identical redundant WebView2Loader.dll from runtimes/."
+          } else {
+            Write-Host "No duplicated WebView2Loader.dll found; preserving existing loader."
+          }
+          if (!(Test-Path $root) -and !(Test-Path $duplicate)) {
+            throw "No WebView2Loader.dll in the published application"
+          }
       - name: Include runtime requirements in artifact
         shell: pwsh
         run: |
