@@ -4,7 +4,7 @@ This fork lets you remove the widget's native title bar while preserving the liv
 
 - **Show title bar** — persistent. Hiding it frees the full reserved top strip for calendar content.
 - **Enable calendar interaction** — enter or leave click-through wallpaper mode. Double-clicking the tray icon switches interaction. The wallpaper stays under desktop icons when interaction is disabled and *Sit behind desktop icons* is enabled in Settings.
-- **Move / resize window** — temporary layout mode. It detaches the window for adjustment and displays the header as a drag handle even if normally hidden. Browser input is disabled while positioning to avoid editing calendar entries accidentally. Choose **Finish moving / resizing** to return to your selected calendar-interaction state.
+- **Move / resize window** — available only while calendar interaction is enabled. Temporarily reveals the header as a drag handle even if normally hidden. Resize using the window edges. The calendar remains interactive. Choose **Finish moving / resizing** to restore your preferred header visibility.
 
 Existing Google sign-in profiles and settings are retained. The header visibility preference is stored in `%LOCALAPPDATA%\CalendarWidget\settings.json`. Layout mode is not persisted.
 

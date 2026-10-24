@@ -31,7 +31,7 @@ public class MainForm : Form
     private Theme theme;                  // chrome colors, following the calendar page's background
     private bool isClickThrough;           // effective OS-level pass-through state
     private bool calendarInteractionEnabled; // the user's independent interaction preference
-    private bool isLayoutUnlocked;         // temporary move/resize mode, without editing calendar events
+    private bool isLayoutUnlocked;         // temporarily reveal the header for dragging in interactive mode
     private bool previewLook;             // interactive mode showing the widget look while Settings is open
     private DateTime? hoverHideDeadline;  // set while the panel is visible but the mouse has left it
     private int guardTick;                // periodic re-assert of click-through styles
@@ -241,16 +241,22 @@ public class MainForm : Form
     public void ToggleClickThrough()
     {
         calendarInteractionEnabled = !calendarInteractionEnabled;
-        // A direct request to interact with the calendar leaves layout mode.
-        if (isLayoutUnlocked)
+        // Layout controls are only available while the calendar is interactive.
+        if (!calendarInteractionEnabled)
             isLayoutUnlocked = false;
         ApplyInteractionModes();
     }
 
     private void ToggleLayoutEditing()
     {
+        if (!calendarInteractionEnabled)
+            return;
+
+        // This only reveals the title bar as a drag handle. Browser interaction
+        // stays enabled and resizing is handled by the normal window frame.
         isLayoutUnlocked = !isLayoutUnlocked;
-        ApplyInteractionModes();
+        ApplyPadding();
+        UpdateHeaderVisibility();
     }
 
     private void SetHeaderVisible(bool visible)
@@ -283,15 +289,15 @@ public class MainForm : Form
     }
 
     /// <summary>
-    /// Interaction and positioning are distinct user preferences. Editing layout
-    /// temporarily detaches the window from WorkerW and reveals its drag/resize
-    /// frame, but disables the browser input so dragging cannot edit events.
+    /// Only calendar interaction determines whether the window is attached to
+    /// the wallpaper or accepts mouse input. The optional layout handle works
+    /// exclusively in interactive mode and never disables the WebView.
     /// </summary>
     private void ApplyInteractionModes()
     {
-        bool passiveWallpaper = !calendarInteractionEnabled && !isLayoutUnlocked;
-        SetClickThrough(passiveWallpaper);
-        webView.Enabled = !isLayoutUnlocked;
+        if (!calendarInteractionEnabled)
+            isLayoutUnlocked = false;
+        SetClickThrough(!calendarInteractionEnabled);
         UpdateHeaderVisibility();
         ApplyPadding();
     }
@@ -911,6 +917,7 @@ public class MainForm : Form
             headerItem.Checked = settings.ShowTitleBar;
             interactionItem.Checked = calendarInteractionEnabled;
             layoutItem.Checked = isLayoutUnlocked;
+            layoutItem.Enabled = calendarInteractionEnabled;
             layoutItem.Text = isLayoutUnlocked ? "Finish moving / resizing" : "Move / resize window";
         };
 
