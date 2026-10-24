@@ -19,8 +19,15 @@ public class AppSettings
         set => Transparency = (int)Math.Round(255 * (100 - Math.Clamp(value, 0, 95)) / 100.0);
     }
 
+    // window chrome can be hidden without changing interaction or desktop attachment
+    public bool ShowTitleBar { get; set; } = true;
+
     // widget mode sits behind the desktop icons (live-wallpaper style, WorkerW reparenting)
     public bool BehindDesktopIcons { get; set; }
+
+    // Interactive windows are normally covered by Windows Show Desktop.
+    // Temporarily lift above the desktop only while the desktop is foreground.
+    public bool KeepInteractiveVisibleOnDesktop { get; set; } = true;
 
     // widget mode darkens the calendar's edges (fading from black to clear) so desktop icons
     // on top read against a smooth backdrop instead of calendar text; width in % of the
@@ -43,6 +50,7 @@ public class AppSettings
     public int WinY { get; set; }
     public int WinW { get; set; }
     public int WinH { get; set; }
+    public bool WinMaximized { get; set; }
 
     public static string DataFolder { get; } =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CalendarWidget");

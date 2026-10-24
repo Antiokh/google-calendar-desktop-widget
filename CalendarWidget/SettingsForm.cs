@@ -21,11 +21,13 @@ public class SettingsForm : Form
     private const int Gutter = 20;         // left/right margin
 
     private readonly MainForm main;
+    private readonly AppSettings settings;
 
     private readonly Label lblAlpha = SectionLabel("TRANSPARENCY");
     private readonly Label valAlpha = ValueLabel(ContentAlignment.TopRight);
     private readonly TrackBar sldAlpha;
     private readonly CheckBox cbBehind;
+    private bool syncingBehindDesktopIcons;
     private readonly Label lblShadow = SectionLabel("EDGE SHADOWS");
     private readonly EdgeShadowSlider sldShadow;
     private readonly Label valShadowLeft = ValueLabel(ContentAlignment.TopLeft);
@@ -52,6 +54,7 @@ public class SettingsForm : Form
     public SettingsForm(MainForm main, AppSettings settings)
     {
         this.main = main;
+        this.settings = settings;
         Text = "Google Calendar Desktop Widget";
         AutoScaleMode = AutoScaleMode.None;  // LayoutForDpi scales everything itself
         FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -82,7 +85,11 @@ public class SettingsForm : Form
 
         // ---- live-wallpaper mode ----
         cbBehind = Check("Sit behind desktop icons (live wallpaper)", settings.BehindDesktopIcons);
-        cbBehind.CheckedChanged += (_, _) => main.SetBehindDesktopIcons(cbBehind.Checked);
+        cbBehind.CheckedChanged += (_, _) =>
+        {
+            if (!syncingBehindDesktopIcons)
+                main.SetBehindDesktopIcons(cbBehind.Checked);
+        };
 
         // ---- edge shadows: dark fades behind desktop icons ----
         sldShadow = new EdgeShadowSlider
@@ -252,11 +259,27 @@ public class SettingsForm : Form
         Location = e.SuggestedRectangle.Location;
     }
 
+    /// <summary>
+    /// Update the Settings checkbox when changed from the tray, including
+    /// while this dialog is open, without echoing a CheckedChanged write.
+    /// </summary>
+    public void SyncBehindDesktopIcons(bool behind)
+    {
+        if (IsDisposed || cbBehind.Checked == behind)
+            return;
+        syncingBehindDesktopIcons = true;
+        try { cbBehind.Checked = behind; }
+        finally { syncingBehindDesktopIcons = false; }
+    }
+
     protected override void OnVisibleChanged(EventArgs e)
     {
         base.OnVisibleChanged(e);
         if (Visible)
+        {
+            SyncBehindDesktopIcons(settings.BehindDesktopIcons);
             RefreshAccountButton();
+        }
         else
             main.EndPreview();  // interactive mode returns to fully opaque once Settings closes
     }

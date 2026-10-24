@@ -12,12 +12,26 @@ internal static class NativeMethods
 
     public const long WS_EX_TRANSPARENT = 0x00000020;  // mouse passes through
     public const long WS_EX_NOACTIVATE = 0x08000000;   // never steals keyboard focus
+    public const long WS_EX_TOPMOST = 0x00000008;     // actual topmost state, not our cached flag
+    public const int WS_MINIMIZEBOX = 0x00020000;
+    public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    public const uint EVENT_SYSTEM_MINIMIZEEND = 0x0017; // a window is about to be restored
+    public const uint WINEVENT_OUTOFCONTEXT = 0;
 
     public const int WM_WINDOWPOSCHANGING = 0x0046;
+    public const int WM_SYSCOMMAND = 0x0112;
+    public const int WM_ENTERSIZEMOVE = 0x0231;
+    public const int WM_EXITSIZEMOVE = 0x0232;
+    public const int SC_SIZE = 0xF000;
+    public const int SC_MOVE = 0xF010;
+    public const int SC_MAXIMIZE = 0xF030;
+    public const int SC_RESTORE = 0xF120;
     public const uint SWP_NOZORDER = 0x0004;
     public const uint SWP_NOSIZE_NOMOVE_NOACTIVATE = 0x0013;
 
     public static readonly IntPtr HWND_BOTTOM = new(1);
+    public static readonly IntPtr HWND_TOPMOST = new(-1);
+    public static readonly IntPtr HWND_NOTOPMOST = new(-2);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct WINDOWPOS
@@ -92,13 +106,85 @@ internal static class NativeMethods
         applied.Clear();
     }
 
-    public static void SendToBottom(IntPtr hwnd) =>
+    public static bool SendToBottom(IntPtr hwnd) =>
         SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE_NOMOVE_NOACTIVATE);
+
+    /// <summary>Read the OS state rather than trusting our last SetWindowPos call.</summary>
+    public static bool IsTopmost(IntPtr hwnd) =>
+        (GetWindowLongPtr(hwnd, GWL_EXSTYLE).ToInt64() & WS_EX_TOPMOST) != 0;
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsIconic(IntPtr hwnd);
 
     // ---- live-wallpaper mode: reparent the widget behind the desktop icons ----
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+
+    private const uint GA_PARENT = 1;
+    private const uint GA_ROOTOWNER = 3;
+    private const uint GW_HWNDNEXT = 2;
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+
+    /// <summary>
+    /// True only if lower occurs below upper in the current native Z-order.
+    /// Bound traversal because Explorer may be rebuilding the window stack.
+    /// </summary>
+    public static bool IsAboveInZOrder(IntPtr upper, IntPtr lower)
+    {
+        if (upper == IntPtr.Zero || lower == IntPtr.Zero || upper == lower ||
+            !IsWindow(upper) || !IsWindow(lower))
+            return false;
+
+        var current = upper;
+        for (int i = 0; i < 1024; i++)
+        {
+            current = GetWindow(current, GW_HWNDNEXT);
+            if (current == IntPtr.Zero)
+                return false;
+            if (current == lower)
+                return true;
+        }
+        return false;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetDesktopWindow();
+
+    /// <summary>
+    /// A NULL SetParent return is ambiguous for an initially top-level HWND.
+    /// Verify actual native parent with GA_PARENT, not GetParent (which can
+    /// return the owner for WS_POPUP windows).
+    /// </summary>
+    public static bool TrySetParent(IntPtr child, IntPtr parent, out int error)
+    {
+        Marshal.SetLastPInvokeError(0);
+        _ = SetParent(child, parent);
+        error = Marshal.GetLastPInvokeError();
+        var expected = parent == IntPtr.Zero ? GetDesktopWindow() : parent;
+        return GetAncestor(child, GA_PARENT) == expected;
+    }
+
+    public static bool HasParent(IntPtr child, IntPtr parent) =>
+        GetAncestor(child, GA_PARENT) == parent;
+
+    /// <summary>
+    /// Resolve a modal popup to its root owning application window so the
+    /// desktop widget cannot end up between a dialog and its main window.
+    /// </summary>
+    public static IntPtr RootOwner(IntPtr hwnd)
+    {
+        if (!IsWindow(hwnd))
+            return IntPtr.Zero;
+        IntPtr root = GetAncestor(hwnd, GA_ROOTOWNER);
+        return root != IntPtr.Zero && IsWindow(root) ? root : hwnd;
+    }
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetParent(IntPtr hWnd);
@@ -111,6 +197,34 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetClassNameW(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    // Foreground changes arrive on our WinForms message-loop thread, much
+    // sooner than a periodic foreground-window poll.
+    public delegate void WinEventProc(
+        IntPtr hook, uint eventType, IntPtr hwnd,
+        int idObject, int idChild, uint eventThread, uint eventTime);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetWinEventHook(
+        uint eventMin, uint eventMax, IntPtr module,
+        WinEventProc callback, uint processId, uint threadId, uint flags);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool UnhookWinEvent(IntPtr hook);
+
+    /// <summary>Win+D / Show Desktop activates the Explorer desktop window.</summary>
+    public static bool IsDesktopForeground(IntPtr window)
+    {
+        if (window == IntPtr.Zero || !IsWindow(window))
+            return false;
+        var cls = new System.Text.StringBuilder(32);
+        GetClassNameW(window, cls, cls.Capacity);
+        return cls.ToString() is "Progman" or "WorkerW";
+    }
 
     /// <summary>Is this handle a live WorkerW? Used to detect when the shell recreated it and orphaned us.</summary>
     public static bool IsWorkerW(IntPtr hwnd)
@@ -199,16 +313,39 @@ internal static class NativeMethods
     public const int WM_NCCALCSIZE = 0x83;
     public const int WM_GETMINMAXINFO = 0x24;
     public const int HTCLIENT = 1;
+    public const int HTCAPTION = 2;
     public const uint SWP_NOZORDER_NOACTIVATE = 0x0014;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+
+    /// <summary>
+    /// Real outer HWND coordinates in screen space. Both this P/Invoke and the
+    /// WinForms Screen coordinates run in the widget's per-monitor DPI context.
+    /// </summary>
+    public static bool TryGetWindowRect(IntPtr hwnd, out Rectangle bounds)
+    {
+        if (GetWindowRect(hwnd, out var rect))
+        {
+            bounds = Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom);
+            return true;
+        }
+        bounds = Rectangle.Empty;
+        return false;
+    }
 
     [DllImport("user32.dll")]
     public static extern uint GetDpiForWindow(IntPtr hwnd);
 
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(Point point, uint flags);
 
     [DllImport("shcore.dll")]
     private static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
@@ -222,6 +359,14 @@ internal static class NativeMethods
     {
         IntPtr monitor = MonitorFromWindow(hwnd, 2 /*MONITOR_DEFAULTTONEAREST*/);
         return GetDpiForMonitor(monitor, 0 /*MDT_EFFECTIVE_DPI*/, out uint dpi, out _) == 0 ? (int)dpi : 96;
+    }
+
+    /// <summary>Effective DPI of the screen that contains a screen-space rectangle.</summary>
+    public static int MonitorDpiAt(Rectangle bounds)
+    {
+        var center = new Point(bounds.Left + bounds.Width / 2, bounds.Top + bounds.Height / 2);
+        IntPtr monitor = MonitorFromPoint(center, 2 /*MONITOR_DEFAULTTONEAREST*/);
+        return GetDpiForMonitor(monitor, 0, out uint dpi, out _) == 0 ? (int)dpi : 96;
     }
 
     /// <summary>

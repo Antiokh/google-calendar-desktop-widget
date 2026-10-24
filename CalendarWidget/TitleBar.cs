@@ -5,7 +5,8 @@
 namespace CalendarWidget;
 
 /// <summary>
-/// The widget's title bar, visible in BOTH modes. It is a separate top-level window
+/// The widget's optional title bar, shown only on request or while arranging the widget.
+ /// It is a separate top-level window
 /// owned by MainForm (owned windows always float directly above their owner), so it is
 /// never subject to the click-through styling applied to the main window's tree — the
 /// controls keep working while the calendar underneath passes clicks to the desktop.
@@ -35,6 +36,7 @@ public class TitleBar : Form
     private readonly Button btnClose;
     private Theme theme = Theme.Dark;
     private bool clickThrough;
+    private bool layoutUnlocked;
     private int btnW = LogicalBtnW;
 
     /// <summary>Bar height in pixels at the bar's DPI; the owner reserves a strip this tall.</summary>
@@ -226,11 +228,13 @@ public class TitleBar : Form
         return b;
     }
 
+    /// <summary>Only an explicitly unlocked interactive layout may move or maximize.</summary>
+    public void SetLayoutUnlocked(bool unlocked) => layoutUnlocked = unlocked;
+
     private void StartDrag(object? sender, MouseEventArgs e)
     {
-        // widget mode: the bar only hosts the toggle/settings buttons — the pinned
-        // widget must not be movable or maximizable by accident
-        if (clickThrough || e.Button != MouseButtons.Left)
+        // A permanently visible title bar must not bypass the layout lock.
+        if (clickThrough || !layoutUnlocked || e.Button != MouseButtons.Left)
             return;
         if (e.Clicks == 2)
         {
