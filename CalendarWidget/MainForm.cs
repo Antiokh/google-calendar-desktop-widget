@@ -67,13 +67,11 @@ public class MainForm : Form
     private IntPtr pendingDemotionForeground;
     private long pendingDemotionStartedAt;
     private long nextPromotionAttemptAt;
-    // Restore events fire before the restored windows finish appearing. Suppress
-    // a fresh desktop promotion while Explorer is completing the reverse gesture.
+    // A minimize-end event alone is not proof of reverse Show Desktop.
+    // Use it only to shorten the foreground settle after an actual focus exit.
     private long restoreTransitionUntil;
+    private long restoreForegroundHintUntil;
     private IntPtr lastForegroundEventWindow;
-    private long restoreBurstDeadline;
-    private IntPtr lastRestoreCandidate;
-    private int restoreBurstCount;
     private readonly NativeMethods.WinEventProc foregroundCallback;
     private IntPtr foregroundHook;
     private IntPtr restoreHook;
@@ -502,10 +500,10 @@ public class MainForm : Form
     }
 
     /// <summary>
-    /// Foreground changes drive regular reconciliation. A window's MINIMIZEEND
-    /// is an earlier, window-level approximation of "Restore All": remove
-    /// temporary TOPMOST *before* Explorer renders the restored windows.
-    /// The one-second polling fallback also covers gestures that restore none.
+    /// Foreground changes drive Z-order reconciliation. MINIMIZEEND is merely
+    /// a hint that restoration might be underway: background programs can
+    /// restore windows without exiting Show Desktop. Only a real foreground
+    /// departure may release temporary TOPMOST. The watchdog is a fallback.
     /// </summary>
     private void OnForegroundWindowChanged(
         IntPtr hook, uint eventType, IntPtr hwnd,
@@ -516,32 +514,15 @@ public class MainForm : Form
 
         if (eventType == NativeMethods.EVENT_SYSTEM_MINIMIZEEND)
         {
-            // MINIMIZEEND is per-window, not proof of "Restore All". A single
-            // unrelated restored application must not dismiss our calendar.
-            // Recognize a batch of at least two distinct windows while the
-            // desktop remains foreground; the ordinary foreground handler
-            // still covers a reverse gesture that restores only one window.
+            // Do not demote here. Two background windows can be restored by
+            // another process while Explorer still owns the foreground.
+            // If focus actually leaves the desktop shortly afterwards, bypass
+            // the normal 180 ms settling delay to complete restoration quickly.
             if (hwnd != IntPtr.Zero && hwnd != Handle && !isClickThrough &&
                 settings.KeepInteractiveVisibleOnDesktop && IsHandleCreated &&
-                interactiveDesktopTopmost && NativeMethods.IsTopmost(Handle) &&
+                NativeMethods.IsTopmost(Handle) &&
                 NativeMethods.IsDesktopForeground(NativeMethods.GetForegroundWindow()))
-            {
-                long now = Environment.TickCount64;
-                if (now > restoreBurstDeadline)
-                    ResetRestoreBurst();
-                restoreBurstDeadline = now + 350;
-                if (hwnd != lastRestoreCandidate)
-                {
-                    lastRestoreCandidate = hwnd;
-                    restoreBurstCount++;
-                }
-                if (restoreBurstCount >= 2)
-                {
-                    ResetRestoreBurst();
-                    restoreTransitionUntil = now + 1200;
-                    ReleaseInteractiveDesktopPromotion();
-                }
-            }
+                restoreForegroundHintUntil = Environment.TickCount64 + 500;
             return;
         }
 
@@ -549,19 +530,22 @@ public class MainForm : Form
         {
             bool desktopNow = NativeMethods.IsDesktopForeground(hwnd);
             bool desktopPreviously = NativeMethods.IsDesktopForeground(lastForegroundEventWindow);
-            // Only events within the *same* desktop foreground episode may
-            // contribute to a two-window Restore All burst.
-            if (desktopNow != desktopPreviously)
-                ResetRestoreBurst();
-            if (desktopNow && !desktopPreviously && lastForegroundEventWindow != IntPtr.Zero)
+            if (desktopNow && !desktopPreviously)
             {
-                // A new Win+D can arrive immediately after an earlier restore.
-                restoreTransitionUntil = 0;
-                nextPromotionAttemptAt = 0;
+                // A new Win+D starts a distinct desktop foreground episode.
+                restoreForegroundHintUntil = 0;
+                if (lastForegroundEventWindow != IntPtr.Zero)
+                {
+                    restoreTransitionUntil = 0;
+                    nextPromotionAttemptAt = 0;
+                }
             }
             else if (!desktopNow && hwnd != IntPtr.Zero)
             {
                 restoreTransitionUntil = 0;
+                // Our own controls gaining focus is not an Explorer restore.
+                if (IsOurForegroundWindow(hwnd) || !desktopPreviously)
+                    restoreForegroundHintUntil = 0;
             }
             lastForegroundEventWindow = hwnd;
             MaintainInteractiveDesktopVisibility();
@@ -578,13 +562,6 @@ public class MainForm : Form
     {
         pendingDemotionForeground = IntPtr.Zero;
         pendingDemotionStartedAt = 0;
-    }
-
-    private void ResetRestoreBurst()
-    {
-        restoreBurstCount = 0;
-        lastRestoreCandidate = IntPtr.Zero;
-        restoreBurstDeadline = 0;
     }
 
     /// <summary>
@@ -653,14 +630,25 @@ public class MainForm : Form
                 return;
             }
 
+            // A restore hint never removes TOPMOST by itself. Only after a
+            // confirmed non-desktop foreground change can it accelerate the
+            // ordinary demotion and keep the restore animation responsive.
+            if (restoreForegroundHintUntil != 0 && now <= restoreForegroundHintUntil)
+            {
+                restoreForegroundHintUntil = 0;
+                restoreTransitionUntil = now + 1200;
+                ReleaseInteractiveDesktopPromotion(foreground);
+                return;
+            }
+            restoreForegroundHintUntil = 0;
             if (pendingDemotionForeground != foreground)
             {
                 pendingDemotionForeground = foreground;
                 pendingDemotionStartedAt = now;
             }
 
-            // In the reverse gesture, don't shove the window behind Explorer
-            // while Windows is still animating the restoration of other windows.
+            // With no matching minimize hint, wait for foreground stability.
+            // Never force HWND_BOTTOM during the reverse Show Desktop gesture.
             if (now - pendingDemotionStartedAt >= ForegroundSettleMs)
             {
                 ReleaseInteractiveDesktopPromotion(foreground);

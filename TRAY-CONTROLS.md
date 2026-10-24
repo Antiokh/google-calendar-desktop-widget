@@ -22,12 +22,19 @@ The tray icon shows today's local day, a small G, and a pointer badge when inter
 
 - Use `EVENT_SYSTEM_FOREGROUND` to reconcile the foreground desktop and actual `WS_EX_TOPMOST` flag. The existing timer performs a once-per-second fallback check.
 - Promotion requests are bounded to avoid repeatedly fighting Explorer over Z-order. Releasing temporary topmost uses **`HWND_NOTOPMOST`**, *not* `HWND_BOTTOM`, because pushing the interactive calendar under every ordinary window caused visible reverse-gesture flicker.
-- `EVENT_SYSTEM_MINIMIZEEND` is **not** a reliable global Restore All event. Treat it only as a batch heuristic (at least two distinct restored windows while Explorer's desktop is foreground); a single unrelated restore cannot trigger demotion. Restores of a single window are handled by the foreground event and fallback.
+- `EVENT_SYSTEM_MINIMIZEEND` is **not** a reliable global Restore All event. It only marks a short-lived hint; **even two or more restored background windows cannot remove TOPMOST while Explorer's desktop remains foreground**. Actual foreground departure confirms the demotion and can use the hint to skip the usual 180 ms settle. Single-window restores and missing events remain covered by foreground handling and the watchdog.
 - This workaround depends on Explorer's native behavior and is not a supported exemption from every Show Desktop gesture.
 
-### Build and testing
+### Installation, runtime requirements and build
 
-Requires the .NET 8 SDK and Windows 10/11:
+**Running the GitHub Actions artifact on Windows 10/11 x64** requires two separate runtimes installed on that machine:
+
+1. **Microsoft .NET Desktop Runtime 8 (x64)** — install the *Desktop Runtime*, not just the ASP.NET Core Runtime or the general .NET Runtime: https://dotnet.microsoft.com/en-us/download/dotnet/8.0
+2. **Microsoft Edge WebView2 Runtime** — for the embedded Google Calendar browser: https://developer.microsoft.com/en-us/microsoft-edge/webview2/
+
+Extract the `calendar-widget-tray-win-x64` artifact and run `CalendarWidget.exe`. It is a **framework-dependent** single-file publish (`--self-contained false`): the executable and accompanying files **do not bundle .NET 8 Desktop Runtime**. The WebView2 Runtime is a separate dependency, even when the .NET Desktop Runtime is installed. If either runtime is absent, install it before starting the app. This is intentional to keep the downloadable artifact smaller; no self-contained packaging is planned in this PR.
+
+**Building from source** additionally requires the .NET 8 SDK and a Windows environment:
 
 ```powershell
 dotnet publish CalendarWidget/CalendarWidget.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
@@ -72,9 +79,9 @@ Existing Google sign-in and local settings are preserved in `%LOCALAPPDATA%\Cale
 
 ### Follow-up self-review: Z-order, system commands and attachment conversion
 
-- Releasing temporary TOPMOST due to `MINIMIZEEND` still uses only `HWND_NOTOPMOST` (the established flicker fix). On a stable foreground switch to an ordinary application, the calendar additionally inserts **below that foreground HWND**, avoiding `HWND_NOTOPMOST` placing it above all non-topmost windows. Never unconditionally use `HWND_BOTTOM` on a reverse Win+D.
+- A `MINIMIZEEND` notification cannot independently release TOPMOST: the foreground must actually leave the desktop first. Demotion uses `HWND_NOTOPMOST`; for a confirmed ordinary-app switch it additionally inserts below that app's root owner. Never unconditionally use `HWND_BOTTOM` on a reverse Win+D.
 - `Move / resize window` also blocks native `WM_SYSCOMMAND` move, size and maximize (plus restore-from-maximized) when locked, while allowing restore from minimization for Explorer gestures. Programmatic display/DPI geometry changes are not intercepted.
-- A change between desktop and non-desktop foreground resets the `MINIMIZEEND` burst detector; restoration candidates cannot leak into another desktop activation episode.
+- The short-lived restore hint is discarded on a new desktop foreground episode, on unrelated foreground changes, or after use; there is no multi-window burst detector to leak across episodes.
 - Both initial and delayed `ScreenToClient` calculations are checked, and the delayed handler revalidates the native parent. Failure skips the unsafe `SetWindowPos` and leaves recovery to the existing WorkerW watchdog.
 
 
@@ -89,3 +96,9 @@ Existing Google sign-in and local settings are preserved in `%LOCALAPPDATA%\Cale
 - On Explorer/WorkerW loss, the actual top-level fallback now reconciles screen geometry while its original wallpaper maximize/restore snapshot is still valid. Original restore bounds remain available on later detach.
 - Disabling live wallpaper persists as a desired setting even if SetParent(NULL) fails. The existing 2–30 second native retry gate eventually detaches the widget while preserving safe click-through until native ancestry is confirmed. Settings stays unchecked, and the tray shows 'disabling…' while pending.
 - Stable switches to applications with modal dialogs place the calendar below the application's root owner (GA_ROOTOWNER), preventing it from sitting between the popup and main window. The proven reverse Win+D path continues to use HWND_NOTOPMOST alone.
+
+
+### Latest self-review: safe restore signal
+
+- Restoring two or more background windows programmatically while the desktop remains foreground must not demote the calendar. `MINIMIZEEND` is only a short-lived hint for faster demotion after a *confirmed* desktop foreground exit; a new desktop episode clears it.
+- Manual Windows checks: reverse Win+D with 0/1/2+ windows, and two background windows restored without activation. The known `HWND_NOTOPMOST` flicker fix is still in place; the revised event timing needs device testing.

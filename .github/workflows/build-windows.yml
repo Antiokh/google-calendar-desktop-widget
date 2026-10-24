@@ -22,7 +22,22 @@ jobs:
           dotnet-version: '8.0.x'
       - name: Publish Windows x64
         run: dotnet publish CalendarWidget/CalendarWidget.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
-      - name: Upload executable
+      - name: Include runtime requirements in artifact
+        shell: pwsh
+        run: |
+          @'
+          CalendarWidget for Windows x64
+          ==============================
+          This is a framework-dependent .NET 8 publish, not a self-contained installer.
+          Install Microsoft .NET Desktop Runtime 8 (x64):
+          https://dotnet.microsoft.com/en-us/download/dotnet/8.0
+          Install Microsoft Edge WebView2 Runtime separately:
+          https://developer.microsoft.com/en-us/microsoft-edge/webview2/
+
+          Extract this archive and launch CalendarWidget.exe.
+          See TRAY-CONTROLS.md in the repository for more information.
+          '@ | Set-Content -Path publish/RUNTIME-REQUIREMENTS.txt -Encoding utf8
+      - name: Upload framework-dependent artifact (.NET 8 Desktop Runtime required)
         uses: actions/upload-artifact@v4
         with:
           name: calendar-widget-tray-win-x64
