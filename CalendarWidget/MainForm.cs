@@ -36,6 +36,7 @@ public class MainForm : Form
     private bool isClickThrough;           // effective OS-level pass-through state
     private bool calendarInteractionEnabled; // the user's independent interaction preference
     private bool isLayoutUnlocked;         // temporarily reveal the header for dragging in interactive mode
+    private bool nativeMoveSizeActive;      // suspend watchdog offscreen recovery during user drag/resize
     private bool previewLook;             // interactive mode showing the widget look while Settings is open
     private DateTime? hoverHideDeadline;  // set while the panel is visible but the mouse has left it
     private int guardTick;                // periodic re-assert of click-through styles
@@ -745,6 +746,14 @@ public class MainForm : Form
     // (taskbar click, alt-tab, shell repositioning) is rewritten to HWND_BOTTOM
     protected override void WndProc(ref Message m)
     {
+        // A user can temporarily drag/resize a window beyond the work area.
+        // Never let the 1s offscreen watchdog fight the native move/size loop.
+        // Reconciliation resumes on the next watchdog tick after the loop.
+        if (m.Msg == NativeMethods.WM_ENTERSIZEMOVE)
+            nativeMoveSizeActive = true;
+        else if (m.Msg == NativeMethods.WM_EXITSIZEMOVE)
+            nativeMoveSizeActive = false;
+
         if (m.Msg == NativeMethods.WM_WINDOWPOSCHANGING && isClickThrough && m.LParam != IntPtr.Zero)
         {
             var wp = Marshal.PtrToStructure<NativeMethods.WINDOWPOS>(m.LParam);
@@ -848,6 +857,7 @@ public class MainForm : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+        nativeMoveSizeActive = false; // a recreated HWND cannot remain in the old modal move loop
         NativeMethods.ApplyRoundedCorners(Handle);  // borderless windows get square corners by default
         if (isClickThrough)
         {
@@ -1455,7 +1465,7 @@ public class MainForm : Form
     private void ReconcileTopLevelGeometry()
     {
         if (!IsHandleCreated || IsDisposed || attachedToDesktop ||
-            desktopStateSnapshotValid || reparentInProgress ||
+            desktopStateSnapshotValid || reparentInProgress || nativeMoveSizeActive ||
             WindowState == FormWindowState.Minimized)
             return;
 
@@ -1488,7 +1498,8 @@ public class MainForm : Form
     /// </summary>
     private void ReconcileUnattachedWallpaperFallback()
     {
-        if (attachedToDesktop || reparentInProgress || desktopDiscoveryInFlight)
+        if (attachedToDesktop || reparentInProgress || desktopDiscoveryInFlight ||
+            nativeMoveSizeActive)
             return;
 
         if (!desktopStateSnapshotValid)
