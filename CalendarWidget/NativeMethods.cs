@@ -109,6 +109,11 @@ internal static class NativeMethods
         applied.Clear();
     }
 
+    /// <summary>
+    /// Explicitly hide below other ordinary windows (used when the user turns
+    /// off Show Desktop visibility). Do NOT use this for passive calendar mode:
+    /// HWND_BOTTOM can also put a top-level widget below Progman/WorkerW.
+    /// </summary>
     public static bool SendToBottom(IntPtr hwnd) =>
         SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE_NOMOVE_NOACTIVATE);
 
@@ -128,6 +133,11 @@ internal static class NativeMethods
     private const uint GA_PARENT = 1;
     private const uint GA_ROOTOWNER = 3;
     private const uint GW_HWNDNEXT = 2;
+    private const uint GW_HWNDPREV = 3;
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr hwnd);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
@@ -136,6 +146,53 @@ internal static class NativeMethods
     /// True only if lower occurs below upper in the current native Z-order.
     /// Bound traversal because Explorer may be rebuilding the window stack.
     /// </summary>
+    /// <summary>
+    /// Keep a top-level click-through calendar behind ordinary application
+    /// windows but ABOVE Explorer's desktop surface. HWND_BOTTOM does not
+    /// guarantee the latter and can make the widget completely disappear.
+    /// Never reorder WorkerW children; their native parent determines the
+    /// proper layer behind the desktop icons.
+    /// </summary>
+    public static bool PlacePassiveAboveDesktop(IntPtr hwnd, bool onlyIfHidden = false)
+    {
+        if (hwnd == IntPtr.Zero || !IsWindow(hwnd) ||
+            GetAncestor(hwnd, GA_PARENT) != GetDesktopWindow())
+            return false;
+
+        // EnumWindows walks the top-level Z-order from front to back. The
+        // first visible Progman/WorkerW is the top desktop shell layer; placing
+        // immediately above it keeps the widget visible without covering apps.
+        IntPtr desktop = IntPtr.Zero;
+        EnumWindows((candidate, _) =>
+        {
+            if (candidate != hwnd && IsWindowVisible(candidate) &&
+                IsDesktopForeground(candidate))
+            {
+                desktop = candidate;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+
+        if (desktop == IntPtr.Zero)
+            return false; // don't blindly fall back to HWND_BOTTOM
+
+        // The once-per-second fallback should only recover an actually hidden
+        // window. Never fight Explorer or another app over an already correct
+        // Z-order position.
+        if (onlyIfHidden && IsAboveInZOrder(hwnd, desktop))
+            return true;
+
+        IntPtr beforeDesktop = GetWindow(desktop, GW_HWNDPREV);
+        if (beforeDesktop == hwnd)
+            return true; // already exactly above the desktop layer
+        if (beforeDesktop != IntPtr.Zero && IsTopmost(beforeDesktop))
+            return false; // do not accidentally promote into the topmost band
+
+        return SetWindowPos(hwnd, beforeDesktop, 0, 0, 0, 0,
+            SWP_NOSIZE_NOMOVE_NOACTIVATE);
+    }
+
     public static bool IsAboveInZOrder(IntPtr upper, IntPtr lower)
     {
         if (upper == IntPtr.Zero || lower == IntPtr.Zero || upper == lower ||
