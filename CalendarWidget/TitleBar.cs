@@ -5,7 +5,8 @@
 namespace CalendarWidget;
 
 /// <summary>
-/// The widget's title bar, visible in BOTH modes. It is a separate top-level window
+/// The widget's optional title bar, shown only on request or while arranging the widget.
+ /// It is a separate top-level window
 /// owned by MainForm (owned windows always float directly above their owner), so it is
 /// never subject to the click-through styling applied to the main window's tree — the
 /// controls keep working while the calendar underneath passes clicks to the desktop.

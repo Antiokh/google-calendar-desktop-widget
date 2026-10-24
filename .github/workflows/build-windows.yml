@@ -1,0 +1,22 @@
+name: Build Windows widget
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Publish Windows x64
+        run: dotnet publish CalendarWidget/CalendarWidget.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: calendar-widget-tray-win-x64
+          path: publish/

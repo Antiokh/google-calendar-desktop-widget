@@ -19,6 +19,9 @@ public class AppSettings
         set => Transparency = (int)Math.Round(255 * (100 - Math.Clamp(value, 0, 95)) / 100.0);
     }
 
+    // window chrome can be hidden without changing interaction or desktop attachment
+    public bool ShowTitleBar { get; set; } = true;
+
     // widget mode sits behind the desktop icons (live-wallpaper style, WorkerW reparenting)
     public bool BehindDesktopIcons { get; set; }
 

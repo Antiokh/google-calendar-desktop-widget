@@ -29,7 +29,9 @@ public class MainForm : Form
     private WebView2? stripBackdrop;      // the strip's color behind the desktop icons: see EnsureStripBackdrop
 
     private Theme theme;                  // chrome colors, following the calendar page's background
-    private bool isClickThrough;
+    private bool isClickThrough;           // effective OS-level pass-through state
+    private bool calendarInteractionEnabled; // the user's independent interaction preference
+    private bool isLayoutUnlocked;         // temporary move/resize mode, without editing calendar events
     private bool previewLook;             // interactive mode showing the widget look while Settings is open
     private DateTime? hoverHideDeadline;  // set while the panel is visible but the mouse has left it
     private int guardTick;                // periodic re-assert of click-through styles
@@ -128,17 +130,25 @@ public class MainForm : Form
     /// </summary>
     private Padding ModePadding()
     {
-        int bar = titleBar.BarHeight;
+        // When the title bar is hidden, its strip belongs to the calendar.
+        // Layout mode temporarily reveals the bar as a safe drag handle.
+        int top = settings.ShowTitleBar || isLayoutUnlocked ? titleBar.BarHeight : 0;
         if (isClickThrough)
-            return new Padding(0, bar, 0, 0);
+            return new Padding(0, top, 0, 0);
         int frame = LogicalToDeviceUnits(6);
-        return new Padding(frame, bar, frame, frame);
+        return new Padding(frame, top, frame, frame);
     }
 
     private void ApplyPadding()
     {
         Padding = ModePadding();
-        stripBackdrop?.SetBounds(0, 0, ClientSize.Width, titleBar.BarHeight);  // fills the reserved strip exactly
+        if (stripBackdrop is not null)
+        {
+            // Do not leave an empty painted strip after removing the header.
+            stripBackdrop.Visible = settings.ShowTitleBar && !isLayoutUnlocked;
+            stripBackdrop.SetBounds(0, 0, ClientSize.Width,
+                stripBackdrop.Visible ? titleBar.BarHeight : 0);
+        }
     }
 
     /// <summary>
@@ -154,6 +164,8 @@ public class MainForm : Form
     /// </summary>
     private async void EnsureStripBackdrop()
     {
+        if (!settings.ShowTitleBar || isLayoutUnlocked)
+            return;
         var env = webView.CoreWebView2?.Environment;
         if (stripBackdrop is not null || env is null)
             return;  // no environment yet: OnLoad calls again once the calendar's WebView is up
@@ -189,14 +201,10 @@ public class MainForm : Form
     {
         base.OnLoad(e);
 
-        // start the bar on the owner's monitor so it is created at that monitor's DPI
-        titleBar.Location = PointToScreen(Point.Empty);
-        titleBar.Show(this);  // owned: always floats directly above the main window
-        titleBar.Reposition();
-
-        // first run: stay interactive so the user can sign in to Google;
-        // afterwards the widget always starts in click-through mode
-        SetClickThrough(!firstRun);
+        // Keep the sign-in experience interactive on the very first run.
+        // Layout unlock is intentionally session-only, never restored at startup.
+        calendarInteractionEnabled = firstRun;
+        ApplyInteractionModes();
         if (firstRun)
         {
             tray.BalloonTipTitle = "Google Calendar Desktop Widget";
@@ -230,7 +238,63 @@ public class MainForm : Form
 
     // ---------------- click-through / interactive ----------------
 
-    public void ToggleClickThrough() => SetClickThrough(!isClickThrough);
+    public void ToggleClickThrough()
+    {
+        calendarInteractionEnabled = !calendarInteractionEnabled;
+        // A direct request to interact with the calendar leaves layout mode.
+        if (isLayoutUnlocked)
+            isLayoutUnlocked = false;
+        ApplyInteractionModes();
+    }
+
+    private void ToggleLayoutEditing()
+    {
+        isLayoutUnlocked = !isLayoutUnlocked;
+        ApplyInteractionModes();
+    }
+
+    private void SetHeaderVisible(bool visible)
+    {
+        settings.ShowTitleBar = visible;
+        ApplyPadding();
+        UpdateHeaderVisibility();
+        if (visible && attachedToDesktop)
+            EnsureStripBackdrop();
+        settings.Save();
+    }
+
+    private void UpdateHeaderVisibility()
+    {
+        if (!IsHandleCreated)
+            return;
+        if (settings.ShowTitleBar || isLayoutUnlocked)
+        {
+            if (!titleBar.Visible)
+            {
+                titleBar.Location = PointToScreen(Point.Empty);
+                titleBar.Show(this);
+            }
+            titleBar.Reposition();
+        }
+        else if (titleBar.Visible)
+        {
+            titleBar.Hide();
+        }
+    }
+
+    /// <summary>
+    /// Interaction and positioning are distinct user preferences. Editing layout
+    /// temporarily detaches the window from WorkerW and reveals its drag/resize
+    /// frame, but disables the browser input so dragging cannot edit events.
+    /// </summary>
+    private void ApplyInteractionModes()
+    {
+        bool passiveWallpaper = !calendarInteractionEnabled && !isLayoutUnlocked;
+        SetClickThrough(passiveWallpaper);
+        webView.Enabled = !isLayoutUnlocked;
+        UpdateHeaderVisibility();
+        ApplyPadding();
+    }
 
     private void SetClickThrough(bool enable)
     {
@@ -813,8 +877,12 @@ public class MainForm : Form
 
     private void EnsureInteractive()
     {
-        if (isClickThrough)
-            SetClickThrough(false);
+        if (!calendarInteractionEnabled || isLayoutUnlocked)
+        {
+            calendarInteractionEnabled = true;
+            isLayoutUnlocked = false;
+            ApplyInteractionModes();
+        }
         Activate();
     }
 
@@ -823,16 +891,34 @@ public class MainForm : Form
     private void SetupTray()
     {
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Toggle interaction", null, (_, _) => ToggleClickThrough());
+        var headerItem = new ToolStripMenuItem("Show title bar", null,
+            (_, _) => SetHeaderVisible(!settings.ShowTitleBar));
+        var interactionItem = new ToolStripMenuItem("Enable calendar interaction", null,
+            (_, _) => ToggleClickThrough());
+        var layoutItem = new ToolStripMenuItem("Move / resize window", null,
+            (_, _) => ToggleLayoutEditing());
+
+        menu.Items.Add(headerItem);
+        menu.Items.Add(interactionItem);
+        menu.Items.Add(layoutItem);
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Settings…", null, (_, _) => ShowSettings());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => Application.Exit());
+
+        menu.Opening += (_, _) =>
+        {
+            headerItem.Checked = settings.ShowTitleBar;
+            interactionItem.Checked = calendarInteractionEnabled;
+            layoutItem.Checked = isLayoutUnlocked;
+            layoutItem.Text = isLayoutUnlocked ? "Finish moving / resizing" : "Move / resize window";
+        };
 
         tray.Icon = Icon ?? SystemIcons.Application;
         tray.Text = "Google Calendar Desktop Widget";
         tray.ContextMenuStrip = menu;
         tray.Visible = true;
-        tray.DoubleClick += (_, _) => ShowSettings();
+        tray.DoubleClick += (_, _) => ToggleClickThrough();
     }
 
     public void ShowSettings()
