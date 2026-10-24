@@ -12,8 +12,9 @@ namespace CalendarWidget;
 
 /// <summary>
 /// Monochrome taskbar calendar date, with no badge, sheet, or background.
-/// The filled day number is always visible. Effective interactive mode adds
-/// a one-pixel rectangular border around the icon, NOT a glyph outline.
+/// The filled day number is always visible at its original large size.
+/// Effective interactive mode uses two top-corner pixels; when the title bar
+/// is visible the pixels become a single one-pixel top row.
 /// Follows Windows' SYSTEM/taskbar theme
 /// rather than AppsUseLightTheme, which can differ in custom light/dark mode.
 /// </summary>
@@ -22,7 +23,7 @@ internal static class TrayIconRenderer
     // Render at 4x the usual 16px notification area icon so downsampling
     // produces smooth numerals. Four source pixels equal one displayed pixel.
     private const int Size = 64;
-    private const float FrameWidth = 4f; // exactly 1px at the 16px tray size
+    private const int StatusPixel = Size / 16; // one pixel in the 16x16 tray rendering
     private const string ThemeKey =
         @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 
@@ -53,7 +54,7 @@ internal static class TrayIconRenderer
         return Color.FromArgb(245, 245, 245);
     }
 
-    public static Icon Create(int day, bool interactive, Color ink)
+    public static Icon Create(int day, bool interactive, bool titleBarVisible, Color ink)
     {
         if (day is < 1 or > 31)
             throw new ArgumentOutOfRangeException(nameof(day));
@@ -71,11 +72,11 @@ internal static class TrayIconRenderer
             path.AddString(day.ToString(CultureInfo.InvariantCulture), family,
                 (int)FontStyle.Bold, 53f, PointF.Empty, format);
 
-            // Center the actual numeral contour (not its font line box).
-            // Keep the glyph inside the optional 1px outer frame, with a
-            // small clear gap between digit and border at 16px scale.
+            // Center the actual numeral contour, not the font line box.
+            // Restore the original large 52px glyph; the status indicator
+            // lives in the top pixel row and never shrinks the date.
             var bounds = path.GetBounds();
-            float scale = Math.Min(46f / bounds.Width, 46f / bounds.Height);
+            float scale = Math.Min(52f / bounds.Width, 52f / bounds.Height);
             using var centered = new Matrix();
             centered.Translate(-bounds.Left, -bounds.Top);
             centered.Scale(scale, scale, MatrixOrder.Append);
@@ -89,11 +90,18 @@ internal static class TrayIconRenderer
 
             if (interactive)
             {
-                // One display pixel wide at 16x16, inset just enough that
-                // GDI+'s centered stroke remains fully inside the icon.
-                // No mouse pointer, extra badge, glyph outline or opaque tile.
-                using var frame = new Pen(ink, FrameWidth);
-                g.DrawRectangle(frame, 3f, 3f, Size - 6f, Size - 6f);
+                // Keep the digits identical in both modes. The interaction
+                // indicator occupies only the icon's first 16px-scaled row:
+                // a dot at either corner, or a full line while the title bar
+                // is shown. No frame around the glyphs or the remaining edges.
+                if (titleBarVisible)
+                    g.FillRectangle(fill, 0, 0, Size, StatusPixel);
+                else
+                {
+                    g.FillRectangle(fill, 0, 0, StatusPixel, StatusPixel);
+                    g.FillRectangle(fill, Size - StatusPixel, 0,
+                        StatusPixel, StatusPixel);
+                }
             }
         }
 
