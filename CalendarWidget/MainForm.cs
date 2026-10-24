@@ -64,6 +64,7 @@ public class MainForm : Form
     // Restore events fire before the restored windows finish appearing. Suppress
     // a fresh desktop promotion while Explorer is completing the reverse gesture.
     private long restoreTransitionUntil;
+    private IntPtr lastForegroundEventWindow;
     private long restoreBurstDeadline;
     private IntPtr lastRestoreCandidate;
     private int restoreBurstCount;
@@ -207,7 +208,7 @@ public class MainForm : Form
         int top = settings.ShowTitleBar || isLayoutUnlocked ? titleBar.BarHeight : 0;
         if (isClickThrough)
             return new Padding(0, top, 0, 0);
-        int frame = LogicalToDeviceUnits(6);
+        int frame = isLayoutUnlocked ? LogicalToDeviceUnits(6) : 0;
         return new Padding(frame, top, frame, frame);
     }
 
@@ -273,6 +274,7 @@ public class MainForm : Form
     {
         base.OnLoad(e);
 
+        lastForegroundEventWindow = NativeMethods.GetForegroundWindow();
         // Subscribe once; unlike timer-based polling this reacts to Explorer
         // foreground changes as they happen. Keep the delegate rooted in a field.
         foregroundHook = NativeMethods.SetWinEventHook(
@@ -364,6 +366,7 @@ public class MainForm : Form
 
     private void UpdateHeaderVisibility()
     {
+        titleBar.SetLayoutUnlocked(isLayoutUnlocked && !isClickThrough);
         if (!IsHandleCreated)
             return;
         if (settings.ShowTitleBar || isLayoutUnlocked)
@@ -482,7 +485,22 @@ public class MainForm : Form
         }
 
         if (eventType == NativeMethods.EVENT_SYSTEM_FOREGROUND)
+        {
+            bool desktopNow = NativeMethods.IsDesktopForeground(hwnd);
+            bool desktopPreviously = NativeMethods.IsDesktopForeground(lastForegroundEventWindow);
+            if (desktopNow && !desktopPreviously && lastForegroundEventWindow != IntPtr.Zero)
+            {
+                // A new Win+D can arrive immediately after an earlier restore.
+                restoreTransitionUntil = 0;
+                nextPromotionAttemptAt = 0;
+            }
+            else if (!desktopNow && hwnd != IntPtr.Zero)
+            {
+                restoreTransitionUntil = 0;
+            }
+            lastForegroundEventWindow = hwnd;
             MaintainInteractiveDesktopVisibility();
+        }
     }
 
     private bool IsOurForegroundWindow(IntPtr hwnd) =>
@@ -641,9 +659,22 @@ public class MainForm : Form
         }
 
         // borderless resize: the padding frame around the webview doubles as resize grips
-        if (m.Msg == NativeMethods.WM_NCHITTEST && !isClickThrough && !NativeMethods.IsZoomed(Handle))
+        if (m.Msg == NativeMethods.WM_NCHITTEST && !isClickThrough)
         {
             base.WndProc(ref m);
+            if (!isLayoutUnlocked)
+            {
+                // Native WS_THICKFRAME can produce resize hits even without
+                // the custom padding grips. Suppress both while locked.
+                if ((int)m.Result is NativeMethods.HTLEFT or NativeMethods.HTRIGHT
+                    or NativeMethods.HTTOP or NativeMethods.HTBOTTOM
+                    or NativeMethods.HTTOPLEFT or NativeMethods.HTTOPRIGHT
+                    or NativeMethods.HTBOTTOMLEFT or NativeMethods.HTBOTTOMRIGHT)
+                    m.Result = new IntPtr(NativeMethods.HTCLIENT);
+                return;
+            }
+            if (NativeMethods.IsZoomed(Handle))
+                return;
             if ((int)m.Result == NativeMethods.HTCLIENT)
             {
                 int x = unchecked((short)(long)m.LParam);
