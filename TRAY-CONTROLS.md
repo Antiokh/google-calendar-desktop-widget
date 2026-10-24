@@ -76,3 +76,9 @@ Existing Google sign-in and local settings are preserved in `%LOCALAPPDATA%\Cale
 - `Move / resize window` also blocks native `WM_SYSCOMMAND` move, size and maximize (plus restore-from-maximized) when locked, while allowing restore from minimization for Explorer gestures. Programmatic display/DPI geometry changes are not intercepted.
 - A change between desktop and non-desktop foreground resets the `MINIMIZEEND` burst detector; restoration candidates cannot leak into another desktop activation episode.
 - Both initial and delayed `ScreenToClient` calculations are checked, and the delayed handler revalidates the native parent. Failure skips the unsafe `SetWindowPos` and leaves recovery to the existing WorkerW watchdog.
+
+
+### Additional self-review fixes: unattached fallback and title strip
+
+- When wallpaper is requested but no WorkerW has yet been found, the widget is still a top-level window. Display-change handling and the existing once-per-second geometry watchdog now recover this fallback if it becomes inaccessible after monitor removal. Reconciliation is skipped during an asynchronous discovery or active reparent, and does not treat a healthy attached WorkerW as a top-level window.
+- After verified native WorkerW parenting, title-strip backdrop initialization now occurs **before** the first screen-to-client coordinate conversion. If that conversion fails and the recovery watchdog must take over, the decorative strip is not silently skipped. Startup still retries when the embedded WebView2 environment becomes available.

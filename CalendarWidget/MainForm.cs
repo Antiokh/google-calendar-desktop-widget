@@ -1179,6 +1179,9 @@ public class MainForm : Form
         }
         attachedToDesktop = true;  // native parent already verified
         attachedWorkerW = workerW;
+        // A failed coordinate conversion must not bypass title-strip setup.
+        // OnLoad handles a not-yet-initialized WebView2 environment as usual.
+        EnsureStripBackdrop();
         if (!NativeMethods.ScreenToClient(workerW, ref pt))
         {
             // Explorer may destroy/reparent WorkerW between SetParent and the
@@ -1191,7 +1194,6 @@ public class MainForm : Form
         if (!NativeMethods.SetWindowPos(Handle, IntPtr.Zero, pt.X, pt.Y,
                 boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE))
             System.Diagnostics.Debug.WriteLine("WorkerW attach: initial SetWindowPos failed; watchdog will retry");
-        EnsureStripBackdrop();  // the painted strip is invisible from here on
 
         // reparenting swaps the DPI context to the primary monitor's: WebView2 re-zooms
         // and WinForms may rescale layout. After the DPI messages drain, compensate the
@@ -1447,12 +1449,27 @@ public class MainForm : Form
         settings.Save();
     }
 
+    /// <summary>
+    /// If wallpaper is requested but Explorer has not supplied WorkerW, the
+    /// window remains a normal top-level (taskbar-hidden) fallback. Keep that
+    /// fallback on a visible monitor without interrupting a pending reparent.
+    /// </summary>
+    private void ReconcileUnattachedWallpaperFallback()
+    {
+        if (!attachedToDesktop && !desktopStateSnapshotValid &&
+            !reparentInProgress && !desktopDiscoveryInFlight)
+            ReconcileTopLevelGeometry();
+    }
+
     private void ReconcileDisplayConfiguration()
     {
         if (IsDisposed || Disposing || !IsHandleCreated)
             return;
         if (settings.BehindDesktopIcons && isClickThrough)
+        {
+            ReconcileUnattachedWallpaperFallback();
             EnsureDesktopAttachment();
+        }
         else
             ReconcileTopLevelGeometry();
     }
@@ -1551,7 +1568,9 @@ public class MainForm : Form
         if (++topLevelGeometryCheckTick >= 10)
         {
             topLevelGeometryCheckTick = 0;
-            if (!settings.BehindDesktopIcons || !isClickThrough)
+            if (settings.BehindDesktopIcons && isClickThrough)
+                ReconcileUnattachedWallpaperFallback();
+            else
                 ReconcileTopLevelGeometry();
         }
 
