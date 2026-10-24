@@ -630,14 +630,15 @@ public class MainForm : Form
                 return;
             }
 
-            // A restore hint never removes TOPMOST by itself. Only after a
-            // confirmed non-desktop foreground change can it accelerate the
-            // ordinary demotion and keep the restore animation responsive.
+            // A restore hint never removes TOPMOST by itself. A confirmed
+            // foreground departure permits early demotion, but the reverse
+            // Show Desktop animation must not insert the widget behind an
+            // arbitrary app HWND: that second Z-order change caused flicker.
             if (restoreForegroundHintUntil != 0 && now <= restoreForegroundHintUntil)
             {
                 restoreForegroundHintUntil = 0;
                 restoreTransitionUntil = now + 1200;
-                ReleaseInteractiveDesktopPromotion(foreground);
+                ReleaseInteractiveDesktopPromotion(); // HWND_NOTOPMOST only
                 return;
             }
             restoreForegroundHintUntil = 0;
@@ -1748,7 +1749,24 @@ public class MainForm : Form
             {
                 settings.KeepInteractiveVisibleOnDesktop = !settings.KeepInteractiveVisibleOnDesktop;
                 settings.Save();
-                MaintainInteractiveDesktopVisibility();
+                if (!settings.KeepInteractiveVisibleOnDesktop)
+                {
+                    // An explicit opt-out is NOT a reverse Win+D gesture.
+                    // HWND_NOTOPMOST alone leaves us above ordinary windows,
+                    // potentially still covering the desktop. After clearing
+                    // TOPMOST, deliberately return to the normal background
+                    // position so the option takes effect immediately.
+                    ReleaseInteractiveDesktopPromotion();
+                    if (!isClickThrough && IsHandleCreated)
+                    {
+                        NativeMethods.SendToBottom(Handle);
+                        interactiveDesktopTopmost = NativeMethods.IsTopmost(Handle);
+                    }
+                }
+                else
+                {
+                    MaintainInteractiveDesktopVisibility();
+                }
             });
 
         menu.Items.Add(headerItem);

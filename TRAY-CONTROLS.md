@@ -102,3 +102,10 @@ Existing Google sign-in and local settings are preserved in `%LOCALAPPDATA%\Cale
 
 - Restoring two or more background windows programmatically while the desktop remains foreground must not demote the calendar. `MINIMIZEEND` is only a short-lived hint for faster demotion after a *confirmed* desktop foreground exit; a new desktop episode clears it.
 - Manual Windows checks: reverse Win+D with 0/1/2+ windows, and two background windows restored without activation. The known `HWND_NOTOPMOST` flicker fix is still in place; the revised event timing needs device testing.
+
+
+### Show Desktop Z-order corrections (latest self-review)
+
+- A short-lived `MINIMIZEEND` restore hint can accelerate demotion **only after the foreground actually leaves the desktop**. That reverse Win+D path now calls `ReleaseInteractiveDesktopPromotion()` **without a foreground HWND**, meaning a single `HWND_NOTOPMOST` operation and no second app-relative Z-order insertion during the animation. Ordinary app switches without a restore hint still settle for 180 ms and place the calendar below the app's root owner.
+- Explicitly unchecking **Stay visible on Show Desktop (experimental)** in the tray is *not* a reverse Win+D animation. It clears temporary TOPMOST and sends the interactive calendar to the bottom of the regular Z-order immediately, so it no longer floats over the desktop. This deliberate user action is the only new `HWND_BOTTOM` use; the reverse-gesture path remains unchanged.
+- Manual Windows regression checks: reverse Win+D with one or multiple restored apps, ordinary app foreground switches (including modals), and **Win+D → calendar visible → disable Stay visible via tray → calendar disappears**.
