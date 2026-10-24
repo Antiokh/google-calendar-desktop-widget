@@ -273,6 +273,25 @@ internal static class NativeMethods
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+
+    /// <summary>
+    /// Real outer HWND coordinates in screen space. Both this P/Invoke and the
+    /// WinForms Screen coordinates run in the widget's per-monitor DPI context.
+    /// </summary>
+    public static bool TryGetWindowRect(IntPtr hwnd, out Rectangle bounds)
+    {
+        if (GetWindowRect(hwnd, out var rect))
+        {
+            bounds = Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom);
+            return true;
+        }
+        bounds = Rectangle.Empty;
+        return false;
+    }
+
     [DllImport("user32.dll")]
     public static extern uint GetDpiForWindow(IntPtr hwnd);
 

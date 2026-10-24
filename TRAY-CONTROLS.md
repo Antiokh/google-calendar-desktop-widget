@@ -52,3 +52,11 @@ Existing Google sign-in and local settings are preserved in `%LOCALAPPDATA%\Cale
 - **Rapid Win+D:** the next foreground transition into Explorer's desktop resets suppression left over from an earlier Restore All.
 - **Layout lock:** when Move / resize is unchecked, disable both the title bar's drag/double-click actions and native border/caption hit testing for moving and resizing. Calendar interaction remains enabled.
 - **CI:** Windows publish verifies compilation only. Actual parent transitions, mixed-DPI scaling, Explorer restarts, and Show Desktop gestures require on-device verification.
+
+
+### Actual HWND reconciliation / native backoff / monitor recovery
+
+- In attached wallpaper mode, the once-a-second watchdog checks `GetWindowRect` for the **actual** child HWND rectangle, not only the stored desired geometry. Significant drift is corrected via parent-relative `SetWindowPos`; a failed initial, delayed, or watchdog positioning call is logged, and the desired screen bounds remain available for a later retry.
+- Native `SetParent` failure triggers the same exponential (2–30 second) backoff as WorkerW discovery failure. The retry gate is also enforced on orphan recovery; backoff resets only after a successful attachment, explicit user toggle, or display-change event.
+- `WM_DISPLAYCHANGE` now handles ordinary top-level interactive and non-WorkerW click-through windows as well as attached wallpapers. A one-second fallback catches late monitor changes; top-level windows are repositioned only when at least 20% of their normal rectangle is inaccessible. Maximized state is preserved, while a changed monitor's working area is used for its restore bounds.
+- `SetParent` WS_CHILD/WS_POPUP compatibility remains a known device-testing concern; it was deliberately not changed in this patch because that could regress already working desktop attachment.

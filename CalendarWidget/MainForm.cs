@@ -41,6 +41,7 @@ public class MainForm : Form
     private int guardTick;                // periodic re-assert of click-through styles
     private int styleBurst;               // fast re-assert right after enabling (Chrome recreates windows)
     private int attachCheckTick;          // throttle for the behind-icons re-attach watchdog
+    private int topLevelGeometryCheckTick;
     private bool desktopDiscoveryInFlight;
     private int desktopDiscoveryFailures;
     private long nextDesktopDiscoveryAt;
@@ -174,6 +175,25 @@ public class MainForm : Form
         int x = Math.Clamp(saved.X, work.Left, work.Right - width);
         int y = Math.Clamp(saved.Y, work.Top, work.Bottom - height);
         return new Rectangle(x, y, width, height);
+    }
+
+    /// <summary>
+    /// The window may intentionally span adjacent screens. Only recover it
+    /// when most of its normal rectangle is no longer visible on any working
+    /// area, rather than snapping legitimate cross-monitor layouts.
+    /// </summary>
+    private static bool NeedsOffscreenRecovery(Rectangle bounds)
+    {
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+            return true;
+        long visibleArea = 0;
+        foreach (var screen in Screen.AllScreens)
+        {
+            var overlap = Rectangle.Intersect(bounds, screen.WorkingArea);
+            visibleArea += (long)overlap.Width * overlap.Height;
+        }
+        long windowArea = (long)bounds.Width * bounds.Height;
+        return visibleArea * 5 < windowArea * 4; // less than 80% visible
     }
 
     private Rectangle InitialBounds()
@@ -705,13 +725,14 @@ public class MainForm : Form
             return;
         }
 
-        // A display change can move the calendar offscreen even if Explorer
-        // keeps exactly the same WorkerW HWND. Refresh monitor geometry in both
-        // cases; a later watchdog tick also covers delayed screen-list updates.
-        if (m.Msg == NativeMethods.WM_DISPLAYCHANGE && settings.BehindDesktopIcons && isClickThrough)
+        // Windows does not always move taskbar-hidden windows after unplugging
+        // a monitor. Validate *both* top-level and WorkerW geometry, including
+        // cases where Explorer retains the same WorkerW handle.
+        if (m.Msg == NativeMethods.WM_DISPLAYCHANGE)
         {
-            ResetDesktopDiscoveryBackoff();
-            BeginInvoke(EnsureDesktopAttachment);
+            if (settings.BehindDesktopIcons && isClickThrough)
+                ResetDesktopDiscoveryBackoff();
+            BeginInvoke(ReconcileDisplayConfiguration);
         }
 
         base.WndProc(ref m);
@@ -989,14 +1010,16 @@ public class MainForm : Form
             {
                 // Explorer unavailable or recycled the candidate before the
                 // discovery completed. Leave the tray responsive and retry later.
-                desktopDiscoveryFailures = Math.Min(desktopDiscoveryFailures + 1, 5);
-                nextDesktopDiscoveryAt = Environment.TickCount64 +
-                    Math.Min(30000, 2000L << (desktopDiscoveryFailures - 1));
+                RecordDesktopDiscoveryFailure();
                 return;
             }
 
-            ResetDesktopDiscoveryBackoff();
-            AttachToWorkerW(workerW);
+            // Successful discovery is not sufficient: SetParent can still fail.
+            // Do not reset retry throttling until native attachment succeeded.
+            if (AttachToWorkerW(workerW))
+                ResetDesktopDiscoveryBackoff();
+            else
+                RecordDesktopDiscoveryFailure();
         }
         catch (Exception ex)
         {
@@ -1007,9 +1030,7 @@ public class MainForm : Form
             // leave the browser's native window frozen until another retry.
             if (reparentInProgress)
                 CancelReparentTransition();
-            desktopDiscoveryFailures = Math.Min(desktopDiscoveryFailures + 1, 5);
-            nextDesktopDiscoveryAt = Environment.TickCount64 +
-                Math.Min(30000, 2000L << (desktopDiscoveryFailures - 1));
+            RecordDesktopDiscoveryFailure();
         }
         finally
         {
@@ -1023,14 +1044,21 @@ public class MainForm : Form
         nextDesktopDiscoveryAt = 0;
     }
 
+    private void RecordDesktopDiscoveryFailure()
+    {
+        desktopDiscoveryFailures = Math.Min(desktopDiscoveryFailures + 1, 5);
+        nextDesktopDiscoveryAt = Environment.TickCount64 +
+            Math.Min(30000, 2000L << (desktopDiscoveryFailures - 1));
+    }
+
     /// <summary>
     /// UI-thread-only attachment after WorkerW discovery on a background thread.
     /// </summary>
-    private void AttachToWorkerW(IntPtr workerW)
+    private bool AttachToWorkerW(IntPtr workerW)
     {
         if (attachedToDesktop || !isClickThrough || !settings.BehindDesktopIcons ||
             !NativeMethods.IsWorkerW(workerW))
-            return;
+            return false;
 
         int generation = ++reparentGeneration;
         reparentInProgress = true;
@@ -1073,11 +1101,12 @@ public class MainForm : Form
             desktopStateSnapshotValid = false;
             maximizedBeforeAttach = false;
             FinishReparentTransition(generation);
-            return;
+            return false;
         }
         NativeMethods.ScreenToClient(workerW, ref pt);  // child coordinates are WorkerW-relative
-        NativeMethods.SetWindowPos(Handle, IntPtr.Zero, pt.X, pt.Y,
-            boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE);
+        if (!NativeMethods.SetWindowPos(Handle, IntPtr.Zero, pt.X, pt.Y,
+                boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE))
+            System.Diagnostics.Debug.WriteLine("WorkerW attach: initial SetWindowPos failed; watchdog will retry");
         attachedToDesktop = true;
         attachedWorkerW = workerW;
         EnsureStripBackdrop();  // the painted strip is invisible from here on
@@ -1099,8 +1128,9 @@ public class MainForm : Form
                     UpdateWallpaperZoom();
                     var p2 = boundsBeforeAttach.Location;
                     NativeMethods.ScreenToClient(workerW, ref p2);
-                    NativeMethods.SetWindowPos(Handle, IntPtr.Zero, p2.X, p2.Y,
-                        boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE);
+                    if (!NativeMethods.SetWindowPos(Handle, IntPtr.Zero, p2.X, p2.Y,
+                            boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE))
+                        System.Diagnostics.Debug.WriteLine("WorkerW attach: delayed SetWindowPos failed; watchdog will retry");
                     ApplyPadding();
                     titleBar.Reposition();
                 }
@@ -1114,6 +1144,7 @@ public class MainForm : Form
         {
             FinishReparentTransition(generation);
         }
+        return true;
     }
 
     private bool DetachFromDesktop()
@@ -1187,9 +1218,9 @@ public class MainForm : Form
     }
 
     /// <summary>
-    /// Reconcile even if the WorkerW HWND is still valid: monitor hot-unplug
-    /// can leave an otherwise healthy window at old screen coordinates.
-    /// Reposition only when the target working area actually differs.
+    /// Correct actual HWND drift (including WinForms/DPI side effects) even
+    /// when the cached desired rectangle has not changed. GetWindowRect is
+    /// screen-relative; SetWindowPos on a WorkerW child is parent-relative.
     /// </summary>
     private void ReconcileAttachedGeometry()
     {
@@ -1199,23 +1230,33 @@ public class MainForm : Form
         var target = maximizedBeforeAttach
             ? Screen.FromRectangle(boundsBeforeAttach).WorkingArea
             : ClampToWorkingArea(boundsBeforeAttach);
-        if (target == boundsBeforeAttach)
-        {
-            UpdateWallpaperZoom(); // scale can change without moving the HWND
+        if (!NativeMethods.TryGetWindowRect(Handle, out var actual))
             return;
-        }
 
-        var childLocation = target.Location;
-        if (!NativeMethods.ScreenToClient(attachedWorkerW, ref childLocation))
-            return;
-        if (NativeMethods.SetWindowPos(Handle, IntPtr.Zero,
-                childLocation.X, childLocation.Y, target.Width, target.Height,
-                NativeMethods.SWP_NOZORDER_NOACTIVATE))
+        // A small tolerance absorbs harmless pixel rounding in DPI transitions.
+        static bool Near(int x, int y) => Math.Abs((long)x - y) <= 2;
+        bool correct = Near(actual.Left, target.Left) && Near(actual.Top, target.Top)
+                    && Near(actual.Width, target.Width) && Near(actual.Height, target.Height);
+
+        if (!correct)
         {
-            boundsBeforeAttach = target;
-            UpdateWallpaperZoom();
+            var childLocation = target.Location;
+            if (!NativeMethods.ScreenToClient(attachedWorkerW, ref childLocation))
+                return;
+            if (!NativeMethods.SetWindowPos(Handle, IntPtr.Zero,
+                    childLocation.X, childLocation.Y, target.Width, target.Height,
+                    NativeMethods.SWP_NOZORDER_NOACTIVATE))
+            {
+                // Do not overwrite our desired bounds; next watchdog can
+                // retry even if no monitor work-area change has happened.
+                System.Diagnostics.Debug.WriteLine("WorkerW geometry reconciliation: SetWindowPos failed");
+                return;
+            }
             titleBar.Reposition();
         }
+
+        boundsBeforeAttach = target;
+        UpdateWallpaperZoom();
     }
 
     /// <summary>
@@ -1240,6 +1281,11 @@ public class MainForm : Form
             return;
         }
 
+        // Honor the same retry gate for a failed orphan detach as for failed
+        // discovery/attachment. Otherwise the 1s watchdog bypasses backoff.
+        if (Environment.TickCount64 < nextDesktopDiscoveryAt)
+            return;
+
         if (attachedToDesktop)
         {
             // The parent may disappear before the frozen attach callback ran.
@@ -1249,9 +1295,7 @@ public class MainForm : Form
                 if (!NativeMethods.TrySetParent(Handle, IntPtr.Zero, out int nativeError))
                 {
                     System.Diagnostics.Debug.WriteLine($"WorkerW orphan recovery failed, GetLastError={nativeError}");
-                    desktopDiscoveryFailures = Math.Min(desktopDiscoveryFailures + 1, 5);
-                    nextDesktopDiscoveryAt = Environment.TickCount64 +
-                        Math.Min(30000, 2000L << (desktopDiscoveryFailures - 1));
+                    RecordDesktopDiscoveryFailure();
                     return;  // retain native attachment state until a successful detach
                 }
                 attachedToDesktop = false;
@@ -1278,6 +1322,51 @@ public class MainForm : Form
                 Bounds = boundsBeforeAttach;
         }
         AttachToDesktop();
+    }
+
+    /// <summary>
+    /// After monitor removal, Windows may leave a normal top-level window
+    /// (interactive or plain click-through) mostly offscreen. Only relocate
+    /// inaccessible bounds; preserve Maximize state and the usable restore
+    /// rectangle. Avoid touching WorkerW attachment transitions.
+    /// </summary>
+    private void ReconcileTopLevelGeometry()
+    {
+        if (!IsHandleCreated || IsDisposed || attachedToDesktop ||
+            desktopStateSnapshotValid || reparentInProgress ||
+            WindowState == FormWindowState.Minimized)
+            return;
+
+        bool maximized = WindowState == FormWindowState.Maximized;
+        var normal = maximized ? RestoreBounds : Bounds;
+        if (!NeedsOffscreenRecovery(normal))
+            return;
+
+        var recovered = ClampToWorkingArea(normal);
+        if (maximized)
+        {
+            // WinForms exposes RestoreBounds only as a getter. Change it
+            // through a brief Normal state, then restore maximization; this
+            // path runs only for an actually inaccessible restore rectangle.
+            WindowState = FormWindowState.Normal;
+            Bounds = recovered;
+            WindowState = FormWindowState.Maximized;
+        }
+        else
+            Bounds = recovered;
+
+        SaveBounds();
+        settings.Save();
+    }
+
+    private void ReconcileDisplayConfiguration()
+    {
+        if (IsDisposed || Disposing || !IsHandleCreated)
+            return;
+        if (settings.BehindDesktopIcons && isClickThrough)
+            EnsureDesktopAttachment();
+        else
+            ReconcileTopLevelGeometry();
     }
 
     public void SetBehindDesktopIcons(bool behind)
@@ -1361,6 +1450,16 @@ public class MainForm : Form
             showDesktopPoll = 0;
             MaintainInteractiveDesktopVisibility();
         }
+        // Monitor notifications can arrive before WinForms' screen list is
+        // updated. Independently verify ordinary top-level visibility every
+        // second without moving fully visible or intentionally spanning windows.
+        if (++topLevelGeometryCheckTick >= 10)
+        {
+            topLevelGeometryCheckTick = 0;
+            if (!settings.BehindDesktopIcons || !isClickThrough)
+                ReconcileTopLevelGeometry();
+        }
+
         // interactive mode: controls are integrated in the title bar; the corner panel only
         // shows as a settings preview, which just has to time out
         if (!isClickThrough)
