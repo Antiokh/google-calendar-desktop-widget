@@ -22,6 +22,10 @@ public class MainForm : Form
         DefaultBackgroundColor = Color.FromArgb(32, 33, 36),  // no white flash while pages load
     };
     private readonly NotifyIcon tray = new();
+    private readonly System.Windows.Forms.Timer trayDatePoll = new() { Interval = 30_000 };
+    private Icon? renderedTrayIcon;
+    private DateTime renderedTrayDate;
+    private bool renderedTrayInteraction;
     private readonly System.Windows.Forms.Timer hoverPoll = new() { Interval = 100 };
     private readonly HoverPanel hoverPanel;
     private readonly TitleBar titleBar;
@@ -72,6 +76,10 @@ public class MainForm : Form
         ApplyThemeColors();
 
         SetupTray();
+        // The taskbar uses the local date rather than the calendar page's viewed week.
+        // Redraw only when the day or interaction mode changes (never every timer tick).
+        trayDatePoll.Tick += (_, _) => RefreshTrayIcon();
+        trayDatePoll.Start();
         hoverPoll.Tick += (_, _) => CheckMouseHover();
         hoverPoll.Start();
     }
@@ -300,6 +308,7 @@ public class MainForm : Form
         SetClickThrough(!calendarInteractionEnabled);
         UpdateHeaderVisibility();
         ApplyPadding();
+        RefreshTrayIcon();
     }
 
     private void SetClickThrough(bool enable)
@@ -921,11 +930,43 @@ public class MainForm : Form
             layoutItem.Text = isLayoutUnlocked ? "Finish moving / resizing" : "Move / resize window";
         };
 
-        tray.Icon = Icon ?? SystemIcons.Application;
-        tray.Text = "Google Calendar Desktop Widget";
         tray.ContextMenuStrip = menu;
+        RefreshTrayIcon();
         tray.Visible = true;
         tray.DoubleClick += (_, _) => ToggleClickThrough();
+    }
+
+    /// <summary>
+    /// Render a tiny calendar containing the system-local day and the interaction state.
+    /// The previous owned icon is disposed after NotifyIcon starts using the new handle.
+    /// </summary>
+    private void RefreshTrayIcon()
+    {
+        var today = DateTime.Today;
+        if (renderedTrayIcon is not null
+            && renderedTrayDate == today
+            && renderedTrayInteraction == calendarInteractionEnabled)
+            return;
+
+        Icon? replacement;
+        try
+        {
+            replacement = TrayIconRenderer.Create(today.Day, calendarInteractionEnabled);
+        }
+        catch (Exception)
+        {
+            // Keep the tray accessible even if GDI drawing fails.
+            replacement = (Icon)(Icon ?? SystemIcons.Application).Clone();
+        }
+
+        var previous = renderedTrayIcon;
+        renderedTrayIcon = replacement;
+        tray.Icon = replacement;
+        tray.Text = $"Google Calendar - {today:dd MMM yyyy} - "
+            + (calendarInteractionEnabled ? "Interactive" : "Wallpaper");
+        renderedTrayDate = today;
+        renderedTrayInteraction = calendarInteractionEnabled;
+        previous?.Dispose();
     }
 
     public void ShowSettings()
@@ -947,13 +988,18 @@ public class MainForm : Form
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         hoverPoll.Stop();
+        trayDatePoll.Stop();
+        trayDatePoll.Dispose();
         // while attached, Bounds are WorkerW-relative and the window can't have moved
         // since attach anyway — the entering-widget-mode SaveBounds already captured them
         if (isClickThrough && !attachedToDesktop)
             SaveBounds();
         settings.Save();
         tray.Visible = false;
+        tray.Icon = null;
         tray.Dispose();
+        renderedTrayIcon?.Dispose();
+        renderedTrayIcon = null;
         base.OnFormClosed(e);
     }
 }

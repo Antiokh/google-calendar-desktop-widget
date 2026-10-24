@@ -19,3 +19,15 @@ dotnet publish CalendarWidget/CalendarWidget.csproj -c Release -r win-x64 --self
 Windows CI publishes an artifact from the PR. Exit the installed widget before launching this version (they share the single-instance mutex).
 
 Note: Windows desktop attachment and WebView2 input behavior need manual testing on a real Windows desktop.
+
+### Dynamic tray icon
+
+The system-tray icon is rendered locally (no Google Calendar API requests):
+
+- Calendar-page silhouette, with a small **G** in the blue header.
+- Today's **local day number** in the calendar page, updated automatically after midnight (30-second polling with redraw only when needed).
+- A white mouse-pointer badge in the lower-right corner when **Enable calendar interaction** is on; absent in wallpaper mode.
+- Hover text also shows the full local date and the interaction state.
+- The tray icon is recreated immediately when toggling interaction and the old native resources are cleaned up.
+
+Note: on taskbars that display tray icons at only 16×16, the date is prioritized; the G is intentionally small.
