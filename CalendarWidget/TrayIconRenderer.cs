@@ -12,8 +12,9 @@ namespace CalendarWidget;
 
 /// <summary>
 /// Monochrome taskbar calendar date, with no badge, sheet, or background.
-/// A filled number means wallpaper/click-through mode; a 1-pixel outline
-/// means effective interactive mode. Follows Windows' SYSTEM/taskbar theme
+/// The filled day number is always visible. Effective interactive mode adds
+/// a one-pixel rectangular border around the icon, NOT a glyph outline.
+/// Follows Windows' SYSTEM/taskbar theme
 /// rather than AppsUseLightTheme, which can differ in custom light/dark mode.
 /// </summary>
 internal static class TrayIconRenderer
@@ -21,7 +22,7 @@ internal static class TrayIconRenderer
     // Render at 4x the usual 16px notification area icon so downsampling
     // produces smooth numerals. Four source pixels equal one displayed pixel.
     private const int Size = 64;
-    private const float OutlineWidth = 4f;
+    private const float FrameWidth = 4f; // exactly 1px at the 16px tray size
     private const string ThemeKey =
         @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 
@@ -71,9 +72,10 @@ internal static class TrayIconRenderer
                 (int)FontStyle.Bold, 53f, PointF.Empty, format);
 
             // Center the actual numeral contour (not its font line box).
-            // Leave room for the one-pixel interactive stroke at 16px scale.
+            // Keep the glyph inside the optional 1px outer frame, with a
+            // small clear gap between digit and border at 16px scale.
             var bounds = path.GetBounds();
-            float scale = Math.Min(52f / bounds.Width, 52f / bounds.Height);
+            float scale = Math.Min(46f / bounds.Width, 46f / bounds.Height);
             using var centered = new Matrix();
             centered.Translate(-bounds.Left, -bounds.Top);
             centered.Scale(scale, scale, MatrixOrder.Append);
@@ -81,18 +83,17 @@ internal static class TrayIconRenderer
                 (Size - bounds.Height * scale) / 2f, MatrixOrder.Append);
             path.Transform(centered);
 
+            // Both modes draw the same solid digit(s).
+            using var fill = new SolidBrush(ink);
+            g.FillPath(fill, path);
+
             if (interactive)
             {
-                using var stroke = new Pen(ink, OutlineWidth)
-                {
-                    LineJoin = LineJoin.Round,
-                };
-                g.DrawPath(stroke, path);
-            }
-            else
-            {
-                using var fill = new SolidBrush(ink);
-                g.FillPath(fill, path);
+                // One display pixel wide at 16x16, inset just enough that
+                // GDI+'s centered stroke remains fully inside the icon.
+                // No mouse pointer, extra badge, glyph outline or opaque tile.
+                using var frame = new Pen(ink, FrameWidth);
+                g.DrawRectangle(frame, 3f, 3f, Size - 6f, Size - 6f);
             }
         }
 
