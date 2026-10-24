@@ -31,3 +31,11 @@ The system-tray icon is rendered locally (no Google Calendar API requests):
 - The tray icon is recreated immediately when toggling interaction and the old native resources are cleaned up.
 
 Note: on taskbars that display tray icons at only 16×16, the date is prioritized; the G is intentionally small.
+
+
+### Desktop placement and Win+D
+
+- **Behind desktop icons (live wallpaper)** is now in the tray menu, using the same setting as the Settings dialog.
+- **Stay visible on Show Desktop (experimental)** defaults to on for interactive mode. When Explorer's desktop becomes the foreground window, the widget is temporarily raised above it without activation. When another app is focused, it returns to the bottom of the window stack. This is not an officially supported Windows exclusion from Win+D and must be tested with Windows 11 Show Desktop / Win+D / touchpad gestures.
+- Normal window bounds and the maximized state are now saved separately. The last normal RestoreBounds rectangle is kept while maximized; the window is restored to that monitor on startup, and WorkerW child coordinates are never written to settings.
+- Reparenting async corrections use a generation check to ignore stale callbacks after rapid mode toggles.

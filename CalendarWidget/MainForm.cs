@@ -45,6 +45,10 @@ public class MainForm : Form
     private IntPtr attachedWorkerW;       // the specific WorkerW we parented into; its destruction = orphaned
     private Rectangle boundsBeforeAttach; // screen bounds to restore on detach (child coords are parent-relative)
     private bool maximizedBeforeAttach;   // attached windows are always Normal; re-maximize on detach
+    private bool reparentInProgress;
+    private int reparentGeneration;
+    private bool interactiveDesktopTopmost;
+    private int showDesktopPoll;
     private Rectangle normalBoundsBeforeAttach;  // the pre-maximize rect to give back to RestoreBounds
     private readonly HashSet<IntPtr> clickThroughApplied = [];  // windows WE made transparent
 
@@ -96,8 +100,16 @@ public class MainForm : Form
         }
     }
 
-    public void ToggleMaximize() =>
-        WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
+    public void ToggleMaximize()
+    {
+        // Capture the pre-maximize restore rectangle, not the transient display bounds.
+        if (WindowState == FormWindowState.Normal)
+            SaveBounds();
+        WindowState = WindowState == FormWindowState.Maximized
+            ? FormWindowState.Normal : FormWindowState.Maximized;
+        SaveBounds();
+        settings.Save();
+    }
 
     protected override void OnLocationChanged(EventArgs e)
     {
@@ -111,12 +123,26 @@ public class MainForm : Form
         titleBar?.Reposition();
     }
 
+    protected override void OnResizeEnd(EventArgs e)
+    {
+        base.OnResizeEnd(e);
+        // ResizeEnd is also raised after moving via the custom title bar.
+        SaveBounds();
+        settings.Save();
+    }
+
     private Rectangle InitialBounds()
     {
-        if (settings.WinW > 0)
-            return new Rectangle(settings.WinX, settings.WinY, settings.WinW, settings.WinH);
+        var display = Screen.AllScreens;
+        if (settings.WinW > 0 && settings.WinH > 0)
+        {
+            var saved = new Rectangle(settings.WinX, settings.WinY, settings.WinW, settings.WinH);
+            // Do not restore windows entirely off-screen after disconnecting a monitor.
+            if (display.Any(s => Rectangle.Intersect(s.WorkingArea, saved).Width >= 64
+                              && Rectangle.Intersect(s.WorkingArea, saved).Height >= 64))
+                return saved;
+        }
 
-        // default: right side of the primary work area (no handle yet: DeviceDpi is the primary's)
         var wa = Screen.PrimaryScreen!.WorkingArea;
         int gap = LogicalToDeviceUnits(20);
         int w = Math.Min(LogicalToDeviceUnits(1000), wa.Width / 2);
@@ -208,6 +234,11 @@ public class MainForm : Form
     protected override async void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
+
+        // Restore the previous screen and maximized state before attaching to
+        // WorkerW, so its working-area geometry is computed from the right monitor.
+        if (settings.WinMaximized)
+            WindowState = FormWindowState.Maximized;
 
         // Keep the sign-in experience interactive on the very first run.
         // Layout unlock is intentionally session-only, never restored at startup.
@@ -313,6 +344,8 @@ public class MainForm : Form
 
     private void SetClickThrough(bool enable)
     {
+        if (enable)
+            ReleaseInteractiveDesktopPromotion();
         isClickThrough = enable;
         previewLook = false;  // widget mode shows the real look; interactive starts opaque again
         if (enable)
@@ -345,6 +378,54 @@ public class MainForm : Form
         titleBar.Reposition();
         ApplyEdgeShadows();  // widget mode only: they'd hide content while interacting
         settings.Save();
+    }
+
+    /// <summary>
+    /// Show Desktop raises Explorer's desktop above ordinary bottom-pinned windows.
+    /// Only while Explorer's desktop is foreground, temporarily promote this
+    /// interactive calendar. When another app receives focus, drop back below it.
+    /// Avoid keyboard hooks, permanent topmost, and focus stealing.
+    /// </summary>
+    private void MaintainInteractiveDesktopVisibility()
+    {
+        if (isClickThrough || !settings.KeepInteractiveVisibleOnDesktop || !IsHandleCreated)
+        {
+            ReleaseInteractiveDesktopPromotion();
+            return;
+        }
+
+        IntPtr foreground = NativeMethods.GetForegroundWindow();
+        if (NativeMethods.IsDesktopForeground(foreground))
+        {
+            if (!interactiveDesktopTopmost)
+            {
+                if (WindowState == FormWindowState.Minimized)
+                    WindowState = settings.WinMaximized
+                        ? FormWindowState.Maximized : FormWindowState.Normal;
+                NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_TOPMOST,
+                    0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE);
+                interactiveDesktopTopmost = true;
+            }
+        }
+        else if (interactiveDesktopTopmost &&
+                 foreground != Handle &&
+                 (!titleBar.IsHandleCreated || foreground != titleBar.Handle) &&
+                 (settingsForm is null || !settingsForm.IsHandleCreated || foreground != settingsForm.Handle))
+        {
+            ReleaseInteractiveDesktopPromotion();
+        }
+    }
+
+    private void ReleaseInteractiveDesktopPromotion()
+    {
+        if (!interactiveDesktopTopmost)
+            return;
+        interactiveDesktopTopmost = false;
+        if (!IsHandleCreated)
+            return;
+        NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_NOTOPMOST,
+            0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE);
+        NativeMethods.SendToBottom(Handle);
     }
 
     // pin the window to the bottom of the Z-order: any attempt to raise it
@@ -616,6 +697,8 @@ public class MainForm : Form
         if (workerW == IntPtr.Zero)
             return;  // shell didn't cooperate; stay a normal bottom-pinned window
 
+        int generation = ++reparentGeneration;
+        reparentInProgress = true;
         NativeMethods.SetRedraw(Handle, false);  // freeze painting so the DPI rescale doesn't flash
 
         // a child window must not be "maximized": drop to Normal sized to the work area
@@ -647,8 +730,11 @@ public class MainForm : Form
         // resume painting in one clean repaint (no visible zoom-in/zoom-out).
         BeginInvoke(() =>
         {
+            if (generation != reparentGeneration)
+                return;
             if (!attachedToDesktop)
             {
+                reparentInProgress = false;
                 NativeMethods.SetRedraw(Handle, true);
                 return;
             }
@@ -660,6 +746,7 @@ public class MainForm : Form
                 boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE);
             ApplyPadding();
             titleBar.Reposition();
+            reparentInProgress = false;
             NativeMethods.SetRedraw(Handle, true);
             NativeMethods.RepaintAll(Handle);
         });
@@ -669,6 +756,8 @@ public class MainForm : Form
     {
         if (!attachedToDesktop)
             return;
+        int generation = ++reparentGeneration;
+        reparentInProgress = true;
         NativeMethods.SetRedraw(Handle, false);
         NativeMethods.SetParent(Handle, IntPtr.Zero);
         attachedToDesktop = false;
@@ -684,15 +773,19 @@ public class MainForm : Form
         // same DPI-context swap in reverse; re-assert geometry after messages drain
         BeginInvoke(() =>
         {
+            if (generation != reparentGeneration)
+                return;
             if (attachedToDesktop)
             {
+                reparentInProgress = false;
                 NativeMethods.SetRedraw(Handle, true);
                 return;
             }
-            if (WindowState == FormWindowState.Normal)
+            if (WindowState == FormWindowState.Normal && Bounds != boundsBeforeAttach)
                 Bounds = boundsBeforeAttach;
             ApplyPadding();
             titleBar.Reposition();
+            reparentInProgress = false;
             NativeMethods.SetRedraw(Handle, true);
             NativeMethods.RepaintAll(Handle);
         });
@@ -719,6 +812,8 @@ public class MainForm : Form
         if (attachedToDesktop)
         {
             // our WorkerW was destroyed: return to a valid top-level state at known-good bounds
+            ++reparentGeneration;
+            reparentInProgress = false;
             NativeMethods.SetParent(Handle, IntPtr.Zero);
             attachedToDesktop = false;
             attachedWorkerW = IntPtr.Zero;
@@ -791,6 +886,12 @@ public class MainForm : Form
 
     private void CheckMouseHover()
     {
+        // Separate foreground handling from the mouse-hover panel.
+        if (++showDesktopPoll >= 3)
+        {
+            showDesktopPoll = 0;
+            MaintainInteractiveDesktopVisibility();
+        }
         // interactive mode: controls are integrated in the title bar; the corner panel only
         // shows as a settings preview, which just has to time out
         if (!isClickThrough)
@@ -912,10 +1013,21 @@ public class MainForm : Form
             (_, _) => ToggleClickThrough());
         var layoutItem = new ToolStripMenuItem("Move / resize window", null,
             (_, _) => ToggleLayoutEditing());
+        var behindIconsItem = new ToolStripMenuItem("Behind desktop icons (live wallpaper)", null,
+            (_, _) => SetBehindDesktopIcons(!settings.BehindDesktopIcons));
+        var showDesktopItem = new ToolStripMenuItem("Stay visible on Show Desktop (experimental)", null,
+            (_, _) =>
+            {
+                settings.KeepInteractiveVisibleOnDesktop = !settings.KeepInteractiveVisibleOnDesktop;
+                settings.Save();
+                MaintainInteractiveDesktopVisibility();
+            });
 
         menu.Items.Add(headerItem);
         menu.Items.Add(interactionItem);
         menu.Items.Add(layoutItem);
+        menu.Items.Add(behindIconsItem);
+        menu.Items.Add(showDesktopItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Settings…", null, (_, _) => ShowSettings());
         menu.Items.Add(new ToolStripSeparator());
@@ -924,6 +1036,8 @@ public class MainForm : Form
         menu.Opening += (_, _) =>
         {
             headerItem.Checked = settings.ShowTitleBar;
+            behindIconsItem.Checked = settings.BehindDesktopIcons;
+            showDesktopItem.Checked = settings.KeepInteractiveVisibleOnDesktop;
             interactionItem.Checked = calendarInteractionEnabled;
             layoutItem.Checked = isLayoutUnlocked;
             layoutItem.Enabled = calendarInteractionEnabled;
@@ -977,23 +1091,33 @@ public class MainForm : Form
 
     private void SaveBounds()
     {
-        if (WindowState != FormWindowState.Normal)
+        // Never persist child coordinates of WorkerW or intermediate DPI/resizing
+        // bounds while the window is being detached or attached.
+        if (attachedToDesktop || reparentInProgress ||
+            WindowState == FormWindowState.Minimized)
             return;
-        settings.WinX = Bounds.X;
-        settings.WinY = Bounds.Y;
-        settings.WinW = Bounds.Width;
-        settings.WinH = Bounds.Height;
+
+        // Maximized forms expose an overhanging native rectangle. RestoreBounds
+        // is the last user-sized rectangle, which is the correct value to save.
+        var normal = WindowState == FormWindowState.Maximized ? RestoreBounds : Bounds;
+        if (normal.Width < 100 || normal.Height < 100)
+            return;
+        settings.WinX = normal.X;
+        settings.WinY = normal.Y;
+        settings.WinW = normal.Width;
+        settings.WinH = normal.Height;
+        settings.WinMaximized = WindowState == FormWindowState.Maximized;
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         hoverPoll.Stop();
+        ReleaseInteractiveDesktopPromotion();
         trayDatePoll.Stop();
         trayDatePoll.Dispose();
-        // while attached, Bounds are WorkerW-relative and the window can't have moved
-        // since attach anyway — the entering-widget-mode SaveBounds already captured them
-        if (isClickThrough && !attachedToDesktop)
-            SaveBounds();
+        // Last ordinary bounds were recorded before attaching into WorkerW.
+        // A normal interactive close must also save its updated placement.
+        SaveBounds();
         settings.Save();
         tray.Visible = false;
         tray.Icon = null;

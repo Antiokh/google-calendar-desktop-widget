@@ -18,6 +18,8 @@ internal static class NativeMethods
     public const uint SWP_NOSIZE_NOMOVE_NOACTIVATE = 0x0013;
 
     public static readonly IntPtr HWND_BOTTOM = new(1);
+    public static readonly IntPtr HWND_TOPMOST = new(-1);
+    public static readonly IntPtr HWND_NOTOPMOST = new(-2);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct WINDOWPOS
@@ -111,6 +113,19 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetClassNameW(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    /// <summary>Win+D / Show Desktop activates the Explorer desktop window.</summary>
+    public static bool IsDesktopForeground(IntPtr window)
+    {
+        if (window == IntPtr.Zero || !IsWindow(window))
+            return false;
+        var cls = new System.Text.StringBuilder(32);
+        GetClassNameW(window, cls, cls.Capacity);
+        return cls.ToString() is "Progman" or "WorkerW";
+    }
 
     /// <summary>Is this handle a live WorkerW? Used to detect when the shell recreated it and orphaned us.</summary>
     public static bool IsWorkerW(IntPtr hwnd)
