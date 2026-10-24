@@ -12,6 +12,9 @@ internal static class NativeMethods
 
     public const long WS_EX_TRANSPARENT = 0x00000020;  // mouse passes through
     public const long WS_EX_NOACTIVATE = 0x08000000;   // never steals keyboard focus
+    public const int WS_MINIMIZEBOX = 0x00020000;
+    public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    public const uint WINEVENT_OUTOFCONTEXT = 0;
 
     public const int WM_WINDOWPOSCHANGING = 0x0046;
     public const uint SWP_NOZORDER = 0x0004;
@@ -116,6 +119,21 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
+
+    // Foreground changes arrive on our WinForms message-loop thread, much
+    // sooner than a periodic foreground-window poll.
+    public delegate void WinEventProc(
+        IntPtr hook, uint eventType, IntPtr hwnd,
+        int idObject, int idChild, uint eventThread, uint eventTime);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetWinEventHook(
+        uint eventMin, uint eventMax, IntPtr module,
+        WinEventProc callback, uint processId, uint threadId, uint flags);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool UnhookWinEvent(IntPtr hook);
 
     /// <summary>Win+D / Show Desktop activates the Explorer desktop window.</summary>
     public static bool IsDesktopForeground(IntPtr window)

@@ -39,3 +39,11 @@ Note: on taskbars that display tray icons at only 16×16, the date is prioritize
 - **Stay visible on Show Desktop (experimental)** defaults to on for interactive mode. When Explorer's desktop becomes the foreground window, the widget is temporarily raised above it without activation. When another app is focused, it returns to the bottom of the window stack. This is not an officially supported Windows exclusion from Win+D and must be tested with Windows 11 Show Desktop / Win+D / touchpad gestures.
 - Normal window bounds and the maximized state are now saved separately. The last normal RestoreBounds rectangle is kept while maximized; the window is restored to that monitor on startup, and WorkerW child coordinates are never written to settings.
 - Reparenting async corrections use a generation check to ignore stale callbacks after rapid mode toggles.
+
+### Reduced Show Desktop flicker
+
+- Handle foreground changes with a native out-of-context `EVENT_SYSTEM_FOREGROUND` hook instead of waiting up to 300 ms for a timer (the 1-second timer now only provides fallback).
+- Clear `WS_MINIMIZEBOX` from the borderless calendar window. Windows Show Desktop minimizes minimizable windows before raising the desktop; the calendar has no minimize UI.
+- When leaving the temporary desktop-visible state, use a single `SetWindowPos(HWND_BOTTOM)`, which both removes the topmost flag and restores bottom Z-order. No intermediate `HWND_NOTOPMOST` move.
+- Foreground callback stays rooted for the application's lifetime and is unhooked on exit.
+- These changes reduce avoidable composition churn; Explorer and WebView2 might still create a one-frame flash on some Windows builds.

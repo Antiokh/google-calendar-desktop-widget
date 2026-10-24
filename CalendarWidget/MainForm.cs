@@ -48,12 +48,16 @@ public class MainForm : Form
     private bool reparentInProgress;
     private int reparentGeneration;
     private bool interactiveDesktopTopmost;
+    private bool updatingDesktopVisibility;
     private int showDesktopPoll;
+    private readonly NativeMethods.WinEventProc foregroundCallback;
+    private IntPtr foregroundHook;
     private Rectangle normalBoundsBeforeAttach;  // the pre-maximize rect to give back to RestoreBounds
     private readonly HashSet<IntPtr> clickThroughApplied = [];  // windows WE made transparent
 
     public MainForm()
     {
+        foregroundCallback = OnForegroundWindowChanged;
         Text = "Google Calendar Desktop Widget";
         FormBorderStyle = FormBorderStyle.None;  // always borderless; TitleBar is the caption in interactive mode
         ShowInTaskbar = false;
@@ -96,6 +100,9 @@ public class MainForm : Form
         {
             var cp = base.CreateParams;
             cp.Style |= NativeMethods.WS_CAPTION | NativeMethods.WS_THICKFRAME | NativeMethods.WS_MAXIMIZEBOX;
+            // Show Desktop first minimizes windows with WS_MINIMIZEBOX. We
+            // have no minimize UI; keep the calendar rendered continuously.
+            cp.Style &= ~NativeMethods.WS_MINIMIZEBOX;
             return cp;
         }
     }
@@ -234,6 +241,14 @@ public class MainForm : Form
     protected override async void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
+
+        // Subscribe once; unlike timer-based polling this reacts to Explorer
+        // foreground changes as they happen. Keep the delegate rooted in a field.
+        foregroundHook = NativeMethods.SetWinEventHook(
+            NativeMethods.EVENT_SYSTEM_FOREGROUND,
+            NativeMethods.EVENT_SYSTEM_FOREGROUND,
+            IntPtr.Zero, foregroundCallback, 0, 0,
+            NativeMethods.WINEVENT_OUTOFCONTEXT);
 
         // Restore the previous screen and maximized state before attaching to
         // WorkerW, so its working-area geometry is computed from the right monitor.
@@ -381,38 +396,60 @@ public class MainForm : Form
     }
 
     /// <summary>
-    /// Show Desktop raises Explorer's desktop above ordinary bottom-pinned windows.
-    /// Only while Explorer's desktop is foreground, temporarily promote this
-    /// interactive calendar. When another app receives focus, drop back below it.
-    /// Avoid keyboard hooks, permanent topmost, and focus stealing.
+    /// Explorer moves the desktop to the top of the Z-order on Win+D.
+    /// Respond to EVENT_SYSTEM_FOREGROUND immediately rather than up to 300 ms
+    /// after the fact. A slow timer remains as a fallback for unusual shells.
     /// </summary>
+    private void OnForegroundWindowChanged(
+        IntPtr hook, uint eventType, IntPtr hwnd,
+        int idObject, int idChild, uint eventThread, uint eventTime)
+    {
+        if (eventType != NativeMethods.EVENT_SYSTEM_FOREGROUND ||
+            idObject != 0 || idChild != 0 || IsDisposed || Disposing)
+            return;
+        MaintainInteractiveDesktopVisibility();
+    }
+
     private void MaintainInteractiveDesktopVisibility()
     {
-        if (isClickThrough || !settings.KeepInteractiveVisibleOnDesktop || !IsHandleCreated)
-        {
-            ReleaseInteractiveDesktopPromotion();
+        if (updatingDesktopVisibility)
             return;
-        }
 
-        IntPtr foreground = NativeMethods.GetForegroundWindow();
-        if (NativeMethods.IsDesktopForeground(foreground))
+        updatingDesktopVisibility = true;
+        try
         {
-            if (!interactiveDesktopTopmost)
+            if (isClickThrough || !settings.KeepInteractiveVisibleOnDesktop || !IsHandleCreated)
             {
-                if (WindowState == FormWindowState.Minimized)
-                    WindowState = settings.WinMaximized
-                        ? FormWindowState.Maximized : FormWindowState.Normal;
-                NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_TOPMOST,
-                    0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE);
-                interactiveDesktopTopmost = true;
+                ReleaseInteractiveDesktopPromotion();
+                return;
+            }
+
+            IntPtr foreground = NativeMethods.GetForegroundWindow();
+            if (NativeMethods.IsDesktopForeground(foreground))
+            {
+                if (!interactiveDesktopTopmost)
+                {
+                    // WS_MINIMIZEBOX is disabled for this window, but a
+                    // defensive restore handles other ways it might be minimized.
+                    if (WindowState == FormWindowState.Minimized)
+                        WindowState = settings.WinMaximized
+                            ? FormWindowState.Maximized : FormWindowState.Normal;
+                    if (NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_TOPMOST,
+                        0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE))
+                        interactiveDesktopTopmost = true;
+                }
+            }
+            else if (interactiveDesktopTopmost &&
+                     foreground != Handle &&
+                     (!titleBar.IsHandleCreated || foreground != titleBar.Handle) &&
+                     (settingsForm is null || !settingsForm.IsHandleCreated || foreground != settingsForm.Handle))
+            {
+                ReleaseInteractiveDesktopPromotion();
             }
         }
-        else if (interactiveDesktopTopmost &&
-                 foreground != Handle &&
-                 (!titleBar.IsHandleCreated || foreground != titleBar.Handle) &&
-                 (settingsForm is null || !settingsForm.IsHandleCreated || foreground != settingsForm.Handle))
+        finally
         {
-            ReleaseInteractiveDesktopPromotion();
+            updatingDesktopVisibility = false;
         }
     }
 
@@ -423,8 +460,8 @@ public class MainForm : Form
         interactiveDesktopTopmost = false;
         if (!IsHandleCreated)
             return;
-        NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_NOTOPMOST,
-            0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE);
+        // HWND_BOTTOM removes topmost status and moves directly to the back
+        // in ONE operation, avoiding an intermediate redraw at NOTOPMOST.
         NativeMethods.SendToBottom(Handle);
     }
 
@@ -887,10 +924,10 @@ public class MainForm : Form
     private void CheckMouseHover()
     {
         // Separate foreground handling from the mouse-hover panel.
-        if (++showDesktopPoll >= 3)
+        if (++showDesktopPoll >= 10)
         {
             showDesktopPoll = 0;
-            MaintainInteractiveDesktopVisibility();
+            MaintainInteractiveDesktopVisibility();  // 1-second safety check only
         }
         // interactive mode: controls are integrated in the title bar; the corner panel only
         // shows as a settings preview, which just has to time out
@@ -1111,6 +1148,11 @@ public class MainForm : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        if (foregroundHook != IntPtr.Zero)
+        {
+            NativeMethods.UnhookWinEvent(foregroundHook);
+            foregroundHook = IntPtr.Zero;
+        }
         hoverPoll.Stop();
         ReleaseInteractiveDesktopPromotion();
         trayDatePoll.Stop();
