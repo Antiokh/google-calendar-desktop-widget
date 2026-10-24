@@ -1,73 +1,38 @@
-## Tray controls (fork addition)
+## Tray-driven desktop calendar (fork)
 
-This fork lets you remove the widget's native title bar while preserving the live Google Calendar below it. Right-click the existing system-tray icon for three independent options:
+This fork displays the signed-in Google Calendar web app directly on the Windows desktop, and adds tray-driven controls:
 
-- **Show title bar** — persistent. Hiding it frees the full reserved top strip for calendar content.
-- **Enable calendar interaction** — enter or leave click-through wallpaper mode. Double-clicking the tray icon switches interaction. The wallpaper stays under desktop icons when interaction is disabled and *Sit behind desktop icons* is enabled in Settings.
-- **Move / resize window** — available only while calendar interaction is enabled. Temporarily reveals the header as a drag handle even if normally hidden. Resize using the window edges. The calendar remains interactive. Choose **Finish moving / resizing** to restore your preferred header visibility.
+- **Show title bar**: persistent. Hide the bar and reclaim its reserved top strip for the calendar.
+- **Enable calendar interaction**: toggle click-through/wallpaper and interactive mode; double-click the tray icon to switch.
+- **Move / resize window**: available only when interaction is enabled. Temporarily reveal a drag handle; resize with the normal window-edge grips.
+- **Behind desktop icons (live wallpaper)**: attach the passive calendar into Explorer's WorkerW layer (also available in Settings).
+- **Stay visible on Show Desktop (experimental)**: keep the interactive calendar visible while Explorer's desktop has foreground focus, without a permanently topmost window. Use the same menu to disable this workaround.
+- **Settings…** and **Exit** remain in the tray.
 
-Existing Google sign-in profiles and settings are retained. The header visibility preference is stored in `%LOCALAPPDATA%\CalendarWidget\settings.json`. Layout mode is not persisted.
+The tray icon shows today's local day, a small G, and a pointer badge when interaction is enabled. The icon refreshes immediately when switching modes, and after the local date changes.
 
-### Build
+### Window geometry and Explorer recovery
 
-Requires .NET 8 SDK and Windows 10/11:
+- Persist both the last normal window bounds and whether the window was maximized.
+- At startup, clamp a restored normal rectangle to its nearest monitor's **working area**, so resize edges and the header remain accessible after monitor changes.
+- During WorkerW attachment, the window may need temporary normal-mode bounds. Preserve its original maximize/restore snapshot across WorkerW destruction, reconnection attempts, and Explorer restarts.
+- Freeze painting only during the DPI-sensitive attach/detach transition. Queued correction callbacks unfreeze in `finally`; if WorkerW disappears, the recovery path invalidates old callbacks and explicitly unfreezes, even when discovering the replacement fails.
+
+### Win+D / Show Desktop
+
+- Use `EVENT_SYSTEM_FOREGROUND` to reconcile the foreground desktop and actual `WS_EX_TOPMOST` flag. The existing timer performs a once-per-second fallback check.
+- Promotion requests are bounded to avoid repeatedly fighting Explorer over Z-order. Releasing temporary topmost uses **`HWND_NOTOPMOST`**, *not* `HWND_BOTTOM`, because pushing the interactive calendar under every ordinary window caused visible reverse-gesture flicker.
+- `EVENT_SYSTEM_MINIMIZEEND` is **not** a reliable global Restore All event. Treat it only as a batch heuristic (at least two distinct restored windows while Explorer's desktop is foreground); a single unrelated restore cannot trigger demotion. Restores of a single window are handled by the foreground event and fallback.
+- This workaround depends on Explorer's native behavior and is not a supported exemption from every Show Desktop gesture.
+
+### Build and testing
+
+Requires the .NET 8 SDK and Windows 10/11:
 
 ```powershell
 dotnet publish CalendarWidget/CalendarWidget.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
 ```
 
-Windows CI publishes an artifact from the PR. Exit the installed widget before launching this version (they share the single-instance mutex).
+GitHub Actions runs on pull requests, on merges/pushes to `main`, and manually. The uploaded artifact is `calendar-widget-tray-win-x64`. Exit the running widget before starting another build because they share a single-instance mutex.
 
-Note: Windows desktop attachment and WebView2 input behavior need manual testing on a real Windows desktop.
-
-### Dynamic tray icon
-
-The system-tray icon is rendered locally (no Google Calendar API requests):
-
-- Calendar-page silhouette, with a small **G** in the blue header.
-- Today's **local day number** in the calendar page, updated automatically after midnight (30-second polling with redraw only when needed).
-- A white mouse-pointer badge in the lower-right corner when **Enable calendar interaction** is on; absent in wallpaper mode.
-- Hover text also shows the full local date and the interaction state.
-- The tray icon is recreated immediately when toggling interaction and the old native resources are cleaned up.
-
-Note: on taskbars that display tray icons at only 16×16, the date is prioritized; the G is intentionally small.
-
-
-### Desktop placement and Win+D
-
-- **Behind desktop icons (live wallpaper)** is now in the tray menu, using the same setting as the Settings dialog.
-- **Stay visible on Show Desktop (experimental)** defaults to on for interactive mode. When Explorer's desktop becomes the foreground window, the widget is temporarily raised above it without activation. When another app is focused, it returns to the bottom of the window stack. This is not an officially supported Windows exclusion from Win+D and must be tested with Windows 11 Show Desktop / Win+D / touchpad gestures.
-- Normal window bounds and the maximized state are now saved separately. The last normal RestoreBounds rectangle is kept while maximized; the window is restored to that monitor on startup, and WorkerW child coordinates are never written to settings.
-- Reparenting async corrections use a generation check to ignore stale callbacks after rapid mode toggles.
-
-### Reduced Show Desktop flicker
-
-- Handle foreground changes with a native out-of-context `EVENT_SYSTEM_FOREGROUND` hook instead of waiting up to 300 ms for a timer (the 1-second timer now only provides fallback).
-- Clear `WS_MINIMIZEBOX` from the borderless calendar window. Windows Show Desktop minimizes minimizable windows before raising the desktop; the calendar has no minimize UI.
-- When leaving the temporary desktop-visible state, use a single `SetWindowPos(HWND_BOTTOM)`, which both removes the topmost flag and restores bottom Z-order. No intermediate `HWND_NOTOPMOST` move.
-- Foreground callback stays rooted for the application's lifetime and is unhooked on exit.
-- These changes reduce avoidable composition churn; Explorer and WebView2 might still create a one-frame flash on some Windows builds.
-
-
-### Native-state reconciliation and reverse-gesture flicker
-
-- The foreground-event callback and the existing 100 ms UI timer now invoke a **single idempotent reconciliation method**. In steady state, the timer reconciles once per second; no new thread or timer is created.
-- Read actual `WS_EX_TOPMOST` via `GetWindowLongPtr` and `IsIconic` for the native minimized state, rather than trusting an internal boolean flag. Correct externally changed Z-order, but never issue redundant `SetWindowPos` calls.
-- On returning from Show Desktop, wait until the same non-desktop foreground window remains stable for ~180 ms before dropping temporary `TOPMOST` status. The existing 100 ms timer completes this transition even if there is no second foreground event.
-- Promotion retries are limited to once per second if Explorer repeatedly overrides Z-order; safety checks retain a once-per-second cadence.
-- This addresses a plausible source of reverse-gesture flicker (premature `HWND_BOTTOM`), but Windows shell animations can still briefly cover the widget on some configurations. Please test Win+D, taskbar Show Desktop, trackpad reverse gesture, and switching to regular applications.
-
-
-### Early restore-all approximation (Win+D reverse gesture)
-
-- Windows does not expose a dedicated global `Restore All` WinEvent; it does send `EVENT_SYSTEM_MINIMIZEEND` **before each individual window is restored**.
-- When the calendar was temporarily promoted above the desktop and another app starts restoring, immediately remove its topmost state via one `HWND_BOTTOM` operation, rather than waiting for foreground activation and the 180 ms debounce.
-- For up to 1.2 seconds while Explorer settles, skip any re-promotion triggered by the still-active desktop HWND. Other restored windows naturally take focus and the calendar stays under them.
-- Retain the foreground-event watcher and 1-second native-state watchdog: no `MINIMIZEEND` is generated when no minimizable windows are open. This also covers taskbar gestures and unusual shell implementations.
-- The test build must be verified on Windows: some gestures may deliver `MINIMIZEEND` at slightly different moments, and Explorer can still paint a transitional frame.
-
-### Reverse Show Desktop Z-order experiment
-
-- On exit from the temporary Show Desktop promotion, call `SetWindowPos(HWND_NOTOPMOST)` instead of `HWND_BOTTOM`. This removes the topmost bit without forcing the calendar below every other ordinary window during Explorer's restore animation.
-- Keep `SendToBottom` for actual click-through/wallpaper mode only. All foreground and minimize-end event handling and the fallback watchdog remain unchanged.
-- Experiment: test reverse Win+D/trackpad gesture and normal app switching. HWND_NOTOPMOST places the window at the top of the **non-topmost** band, so if it covers a restored application briefly, that observation informs the next fix.
+Existing Google sign-in and local settings are preserved in `%LOCALAPPDATA%\CalendarWidget`. Runtime behaviors that require manual verification: reverse Win+D and touchpad gestures; ordinary app restore; WorkerW destruction/Explorer restart; hot-plugging and DPI mismatches; maximized/normal round-trips; Google login persistence. Successful compilation alone does not validate these Windows-shell scenarios.

@@ -45,6 +45,7 @@ public class MainForm : Form
     private IntPtr attachedWorkerW;       // the specific WorkerW we parented into; its destruction = orphaned
     private Rectangle boundsBeforeAttach; // screen bounds to restore on detach (child coords are parent-relative)
     private bool maximizedBeforeAttach;   // attached windows are always Normal; re-maximize on detach
+    private bool desktopStateSnapshotValid; // retain original maximized state across WorkerW recreation
     private bool reparentInProgress;
     private int reparentGeneration;
     private bool interactiveDesktopTopmost;
@@ -60,6 +61,9 @@ public class MainForm : Form
     // Restore events fire before the restored windows finish appearing. Suppress
     // a fresh desktop promotion while Explorer is completing the reverse gesture.
     private long restoreTransitionUntil;
+    private long restoreBurstDeadline;
+    private IntPtr lastRestoreCandidate;
+    private int restoreBurstCount;
     private readonly NativeMethods.WinEventProc foregroundCallback;
     private IntPtr foregroundHook;
     private IntPtr restoreHook;
@@ -151,14 +155,20 @@ public class MainForm : Form
 
     private Rectangle InitialBounds()
     {
-        var display = Screen.AllScreens;
         if (settings.WinW > 0 && settings.WinH > 0)
         {
             var saved = new Rectangle(settings.WinX, settings.WinY, settings.WinW, settings.WinH);
-            // Do not restore windows entirely off-screen after disconnecting a monitor.
-            if (display.Any(s => Rectangle.Intersect(s.WorkingArea, saved).Width >= 64
-                              && Rectangle.Intersect(s.WorkingArea, saved).Height >= 64))
-                return saved;
+            // Prefer the monitor containing most of the saved rectangle. If it
+            // was unplugged, Screen.FromRectangle selects the nearest monitor.
+            var work = Screen.FromRectangle(saved).WorkingArea;
+            // Fit an existing window to the usable working area, not merely a
+            // 64x64 intersection; even with the header hidden the resize edges
+            // must remain accessible.
+            int w = Math.Clamp(saved.Width, Math.Min(320, work.Width), work.Width);
+            int h = Math.Clamp(saved.Height, Math.Min(200, work.Height), work.Height);
+            int x = Math.Clamp(saved.X, work.Left, work.Right - w);
+            int y = Math.Clamp(saved.Y, work.Top, work.Bottom - h);
+            return new Rectangle(x, y, w, h);
         }
 
         var wa = Screen.PrimaryScreen!.WorkingArea;
@@ -429,14 +439,34 @@ public class MainForm : Form
 
         if (eventType == NativeMethods.EVENT_SYSTEM_MINIMIZEEND)
         {
+            // MINIMIZEEND is per-window, not proof of "Restore All". A single
+            // unrelated restored application must not dismiss our calendar.
+            // Recognize a batch of at least two distinct windows while the
+            // desktop remains foreground; the ordinary foreground handler
+            // still covers a reverse gesture that restores only one window.
             if (hwnd != IntPtr.Zero && hwnd != Handle && !isClickThrough &&
                 settings.KeepInteractiveVisibleOnDesktop && IsHandleCreated &&
-                NativeMethods.IsTopmost(Handle))
+                interactiveDesktopTopmost && NativeMethods.IsTopmost(Handle) &&
+                NativeMethods.IsDesktopForeground(NativeMethods.GetForegroundWindow()))
             {
-                // Keep Explorer's reverse transition from triggering a new
-                // topmost promotion while the foreground is still desktop.
-                restoreTransitionUntil = Environment.TickCount64 + 1200;
-                ReleaseInteractiveDesktopPromotion();
+                long now = Environment.TickCount64;
+                if (now > restoreBurstDeadline)
+                {
+                    restoreBurstCount = 0;
+                    lastRestoreCandidate = IntPtr.Zero;
+                }
+                restoreBurstDeadline = now + 350;
+                if (hwnd != lastRestoreCandidate)
+                {
+                    lastRestoreCandidate = hwnd;
+                    restoreBurstCount++;
+                }
+                if (restoreBurstCount >= 2)
+                {
+                    restoreBurstCount = 0;
+                    restoreTransitionUntil = now + 1200;
+                    ReleaseInteractiveDesktopPromotion();
+                }
             }
             return;
         }
@@ -828,6 +858,28 @@ public class MainForm : Form
 
     // ---------------- live-wallpaper mode (behind desktop icons) ----------------
 
+    /// <summary>
+    /// The queued DPI-correction callback owns completion of a redraw freeze.
+    /// Only the current generation may thaw it; superseding paths must either
+    /// queue a new callback or explicitly thaw using CancelReparentTransition.
+    /// </summary>
+    private void FinishReparentTransition(int generation)
+    {
+        if (generation != reparentGeneration)
+            return;
+        reparentInProgress = false;
+        NativeMethods.SetRedraw(Handle, true);
+        NativeMethods.RepaintAll(Handle);
+    }
+
+    private void CancelReparentTransition()
+    {
+        ++reparentGeneration;  // invalidates any queued callback
+        reparentInProgress = false;
+        NativeMethods.SetRedraw(Handle, true);
+        NativeMethods.RepaintAll(Handle);
+    }
+
     /// <summary>Reparent into the shell's WorkerW layer so the widget renders UNDER the desktop icons.</summary>
     private void AttachToDesktop()
     {
@@ -844,10 +896,17 @@ public class MainForm : Form
         // a child window must not be "maximized": drop to Normal sized to the work area
         // (no invisible-frame overhang, no WM_NCCALCSIZE maximize inset) and re-maximize
         // on detach. RestoreBounds keeps the pre-maximize rect for later.
-        maximizedBeforeAttach = WindowState == FormWindowState.Maximized;
-        if (maximizedBeforeAttach)
+        if (!desktopStateSnapshotValid)
         {
-            normalBoundsBeforeAttach = RestoreBounds;
+            // Snapshot only once per wallpaper session; Win11 may destroy and
+            // recreate WorkerW several times without a mode change.
+            maximizedBeforeAttach = WindowState == FormWindowState.Maximized;
+            if (maximizedBeforeAttach)
+                normalBoundsBeforeAttach = RestoreBounds;
+            desktopStateSnapshotValid = true;
+        }
+        if (maximizedBeforeAttach && WindowState == FormWindowState.Maximized)
+        {
             var wa = Screen.FromControl(this).WorkingArea;
             WindowState = FormWindowState.Normal;
             Bounds = wa;
@@ -868,34 +927,55 @@ public class MainForm : Form
         // and WinForms may rescale layout. After the DPI messages drain, compensate the
         // browser zoom and re-assert physical geometry so nothing shifts or resizes, then
         // resume painting in one clean repaint (no visible zoom-in/zoom-out).
-        BeginInvoke(() =>
+        try
         {
-            if (generation != reparentGeneration)
-                return;
-            if (!attachedToDesktop)
+            BeginInvoke(() =>
             {
-                reparentInProgress = false;
-                NativeMethods.SetRedraw(Handle, true);
-                return;
-            }
-            uint dpiAfter = Math.Max(1, NativeMethods.GetDpiForWindow(Handle));
-            try { webView.ZoomFactor = dpiBefore / (double)dpiAfter; } catch { }
-            var p2 = boundsBeforeAttach.Location;
-            NativeMethods.ScreenToClient(workerW, ref p2);
-            NativeMethods.SetWindowPos(Handle, IntPtr.Zero, p2.X, p2.Y,
-                boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE);
-            ApplyPadding();
-            titleBar.Reposition();
-            reparentInProgress = false;
-            NativeMethods.SetRedraw(Handle, true);
-            NativeMethods.RepaintAll(Handle);
-        });
+                if (generation != reparentGeneration)
+                    return;
+                try
+                {
+                    if (!attachedToDesktop)
+                        return;
+                    uint dpiAfter = Math.Max(1, NativeMethods.GetDpiForWindow(Handle));
+                    try { webView.ZoomFactor = dpiBefore / (double)dpiAfter; } catch { }
+                    var p2 = boundsBeforeAttach.Location;
+                    NativeMethods.ScreenToClient(workerW, ref p2);
+                    NativeMethods.SetWindowPos(Handle, IntPtr.Zero, p2.X, p2.Y,
+                        boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE);
+                    ApplyPadding();
+                    titleBar.Reposition();
+                }
+                finally
+                {
+                    FinishReparentTransition(generation);
+                }
+            });
+        }
+        catch (InvalidOperationException)
+        {
+            FinishReparentTransition(generation);
+        }
     }
 
     private void DetachFromDesktop()
     {
         if (!attachedToDesktop)
+        {
+            // The WorkerW watchdog may already have returned us to the
+            // top-level desktop. Restore the saved maximize state anyway.
+            if (desktopStateSnapshotValid)
+            {
+                if (maximizedBeforeAttach)
+                {
+                    Bounds = normalBoundsBeforeAttach;
+                    WindowState = FormWindowState.Maximized;
+                }
+                desktopStateSnapshotValid = false;
+                maximizedBeforeAttach = false;
+            }
             return;
+        }
         int generation = ++reparentGeneration;
         reparentInProgress = true;
         NativeMethods.SetRedraw(Handle, false);
@@ -908,27 +988,35 @@ public class MainForm : Form
         {
             Bounds = normalBoundsBeforeAttach;  // seed RestoreBounds with the original rect
             WindowState = FormWindowState.Maximized;
-            maximizedBeforeAttach = false;
         }
+        desktopStateSnapshotValid = false;
+        maximizedBeforeAttach = false;
         // same DPI-context swap in reverse; re-assert geometry after messages drain
-        BeginInvoke(() =>
+        try
         {
-            if (generation != reparentGeneration)
-                return;
-            if (attachedToDesktop)
+            BeginInvoke(() =>
             {
-                reparentInProgress = false;
-                NativeMethods.SetRedraw(Handle, true);
-                return;
-            }
-            if (WindowState == FormWindowState.Normal && Bounds != boundsBeforeAttach)
-                Bounds = boundsBeforeAttach;
-            ApplyPadding();
-            titleBar.Reposition();
-            reparentInProgress = false;
-            NativeMethods.SetRedraw(Handle, true);
-            NativeMethods.RepaintAll(Handle);
-        });
+                if (generation != reparentGeneration)
+                    return;
+                try
+                {
+                    if (attachedToDesktop)
+                        return;
+                    if (WindowState == FormWindowState.Normal && Bounds != boundsBeforeAttach)
+                        Bounds = boundsBeforeAttach;
+                    ApplyPadding();
+                    titleBar.Reposition();
+                }
+                finally
+                {
+                    FinishReparentTransition(generation);
+                }
+            });
+        }
+        catch (InvalidOperationException)
+        {
+            FinishReparentTransition(generation);
+        }
     }
 
     /// <summary>
@@ -951,13 +1039,19 @@ public class MainForm : Form
 
         if (attachedToDesktop)
         {
-            // our WorkerW was destroyed: return to a valid top-level state at known-good bounds
-            ++reparentGeneration;
-            reparentInProgress = false;
-            NativeMethods.SetParent(Handle, IntPtr.Zero);
-            attachedToDesktop = false;
-            attachedWorkerW = IntPtr.Zero;
-            Bounds = boundsBeforeAttach;
+            // The parent may disappear before the frozen attach callback ran.
+            // Always thaw even if no replacement WorkerW can be discovered.
+            try
+            {
+                NativeMethods.SetParent(Handle, IntPtr.Zero);
+                attachedToDesktop = false;
+                attachedWorkerW = IntPtr.Zero;
+                Bounds = boundsBeforeAttach;
+            }
+            finally
+            {
+                CancelReparentTransition();
+            }
         }
         AttachToDesktop();
     }
@@ -1235,7 +1329,7 @@ public class MainForm : Form
     {
         // Never persist child coordinates of WorkerW or intermediate DPI/resizing
         // bounds while the window is being detached or attached.
-        if (attachedToDesktop || reparentInProgress ||
+        if (attachedToDesktop || desktopStateSnapshotValid || reparentInProgress ||
             WindowState == FormWindowState.Minimized)
             return;
 
