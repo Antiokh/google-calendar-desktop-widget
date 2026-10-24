@@ -468,7 +468,13 @@ public class MainForm : Form
             // catch any window Chrome recreates asynchronously — only this window's tree
             // goes transparent; the owned TitleBar stays clickable.
             SetOpacity(settings.Transparency / 255.0);
-            NativeMethods.SendToBottom(Handle);
+            // HWND_BOTTOM can put the top-level calendar BELOW Explorer's
+            // desktop windows, making it invisible after an interactive toggle.
+            // While WorkerW discovery is asynchronous, keep its top-level
+            // fallback visibly above desktop but below ordinary applications.
+            if (!attachedToDesktop &&
+                !NativeMethods.PlacePassiveAboveDesktop(Handle))
+                System.Diagnostics.Debug.WriteLine("Passive Z-order: desktop placement unavailable; preserving current order");
             if (settings.BehindDesktopIcons)
                 AttachToDesktop();
         }
@@ -743,8 +749,9 @@ public class MainForm : Form
             PlaceBelowForegroundAppIfNeeded(stableAppForeground);
     }
 
-    // pin the window to the bottom of the Z-order: any attempt to raise it
-    // (taskbar click, alt-tab, shell repositioning) is rewritten to HWND_BOTTOM
+    // Passive mode uses explicit desktop-relative placement, not a blanket
+    // WM_WINDOWPOSCHANGING override: changing NOZORDER requests into
+    // HWND_BOTTOM used to bury the form during opacity/DPI/reparent updates.
     protected override void WndProc(ref Message m)
     {
         // A user can temporarily drag/resize a window beyond the work area.
@@ -754,14 +761,6 @@ public class MainForm : Form
             nativeMoveSizeActive = true;
         else if (m.Msg == NativeMethods.WM_EXITSIZEMOVE)
             nativeMoveSizeActive = false;
-
-        if (m.Msg == NativeMethods.WM_WINDOWPOSCHANGING && isClickThrough && m.LParam != IntPtr.Zero)
-        {
-            var wp = Marshal.PtrToStructure<NativeMethods.WINDOWPOS>(m.LParam);
-            wp.hwndInsertAfter = NativeMethods.HWND_BOTTOM;
-            wp.flags &= ~NativeMethods.SWP_NOZORDER;
-            Marshal.StructureToPtr(wp, m.LParam, false);
-        }
 
         // The mouse hit-test is not the only layout entry point: Alt+Space,
         // keyboard shortcuts, and system-menu actions can issue WM_SYSCOMMAND
@@ -872,7 +871,8 @@ public class MainForm : Form
         if (isClickThrough)
         {
             NativeMethods.AddExStyle(Handle, NativeMethods.WS_EX_TRANSPARENT | NativeMethods.WS_EX_NOACTIVATE);
-            NativeMethods.SendToBottom(Handle);
+            if (!attachedToDesktop && !reparentInProgress)
+                NativeMethods.PlacePassiveAboveDesktop(Handle);
         }
     }
 
@@ -1573,7 +1573,7 @@ public class MainForm : Form
         }
         pendingWallpaperDetach = false;
         ResetDesktopDiscoveryBackoff();
-        NativeMethods.SendToBottom(Handle);
+        NativeMethods.PlacePassiveAboveDesktop(Handle);
     }
 
     public void SetBehindDesktopIcons(bool behind)
@@ -1592,7 +1592,7 @@ public class MainForm : Form
                 RecordDesktopDiscoveryFailure();
             }
             else
-                NativeMethods.SendToBottom(Handle);
+                NativeMethods.PlacePassiveAboveDesktop(Handle);
         }
         settings.Save();
     }
@@ -1672,6 +1672,15 @@ public class MainForm : Form
                 ReconcileUnattachedWallpaperFallback();
             else
                 ReconcileTopLevelGeometry();
+
+            // Explorer may reorder windows when the calendar relinquishes
+            // foreground focus. Recover only if a passive top-level fallback
+            // actually fell BELOW the desktop. Attached WorkerW children are
+            // never repositioned by this top-level guard.
+            if (isClickThrough && !attachedToDesktop &&
+                !reparentInProgress && !desktopDiscoveryInFlight &&
+                IsHandleCreated && !NativeMethods.IsIconic(Handle))
+                NativeMethods.PlacePassiveAboveDesktop(Handle, onlyIfHidden: true);
         }
 
         // interactive mode: controls are integrated in the title bar; the corner panel only
