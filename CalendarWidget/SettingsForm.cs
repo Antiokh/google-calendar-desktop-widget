@@ -256,7 +256,13 @@ public class SettingsForm : Form
     {
         base.OnVisibleChanged(e);
         if (Visible)
+        {
+            // The tray menu can change this setting while Settings is closed.
+            // Keep the two entry points synchronized when the dialog reopens.
+            if (cbBehind.Checked != settings.BehindDesktopIcons)
+                cbBehind.Checked = settings.BehindDesktopIcons;
             RefreshAccountButton();
+        }
         else
             main.EndPreview();  // interactive mode returns to fully opaque once Settings closes
     }
