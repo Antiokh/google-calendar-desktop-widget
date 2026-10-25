@@ -30,6 +30,7 @@ public class MainForm : Form
 
     private Theme theme;                  // chrome colors, following the calendar page's background
     private bool isClickThrough;
+    private bool isLayoutUnlocked;  // persisted independently of click-through
     private bool previewLook;             // interactive mode showing the widget look while Settings is open
     private DateTime? hoverHideDeadline;  // set while the panel is visible but the mouse has left it
     private int guardTick;                // periodic re-assert of click-through styles
@@ -49,6 +50,7 @@ public class MainForm : Form
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
         Bounds = InitialBounds();
+        isLayoutUnlocked = settings.LayoutUnlocked;
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { /* keep default */ }
 
         // the bar is a separate owned window floating over the form's top edge; the padding
@@ -60,6 +62,7 @@ public class MainForm : Form
             ApplyPadding();
             titleBar.Reposition();
         };
+        titleBar.SetLayoutUnlocked(isLayoutUnlocked);
         ApplyPadding();
         Controls.Add(webView);
 
@@ -128,17 +131,23 @@ public class MainForm : Form
     /// </summary>
     private Padding ModePadding()
     {
-        int bar = titleBar.BarHeight;
+        // Layout editing never overrides the explicit Show title bar preference.
+        int bar = settings.ShowTitleBar ? titleBar.BarHeight : 0;
         if (isClickThrough)
             return new Padding(0, bar, 0, 0);
-        int frame = LogicalToDeviceUnits(6);
+        int frame = isLayoutUnlocked ? LogicalToDeviceUnits(6) : 0;
         return new Padding(frame, bar, frame, frame);
     }
 
     private void ApplyPadding()
     {
         Padding = ModePadding();
-        stripBackdrop?.SetBounds(0, 0, ClientSize.Width, titleBar.BarHeight);  // fills the reserved strip exactly
+        if (stripBackdrop is not null)
+        {
+            stripBackdrop.Visible = settings.ShowTitleBar && isClickThrough;
+            stripBackdrop.SetBounds(0, 0, ClientSize.Width,
+                stripBackdrop.Visible ? titleBar.BarHeight : 0);
+        }
     }
 
     /// <summary>
@@ -191,8 +200,8 @@ public class MainForm : Form
 
         // start the bar on the owner's monitor so it is created at that monitor's DPI
         titleBar.Location = PointToScreen(Point.Empty);
-        titleBar.Show(this);  // owned: always floats directly above the main window
-        titleBar.Reposition();
+        titleBar.Show(this);  // owned controls can be available in either mode
+        UpdateHeaderVisibility();
 
         // first run: stay interactive so the user can sign in to Google;
         // afterwards the widget always starts in click-through mode
@@ -230,7 +239,78 @@ public class MainForm : Form
 
     // ---------------- click-through / interactive ----------------
 
+    public bool CalendarInteractionEnabled => !isClickThrough;
+
     public void ToggleClickThrough() => SetClickThrough(!isClickThrough);
+    public void SetCalendarInteraction(bool enabled)
+    {
+        if (enabled != !isClickThrough)
+            SetClickThrough(!enabled);
+    }
+
+    public void SetLayoutEditing(bool enabled)
+    {
+        if (isLayoutUnlocked == enabled) return;
+        isLayoutUnlocked = enabled;
+        settings.LayoutUnlocked = enabled;
+        ApplyPadding();
+        UpdateHeaderVisibility();
+        settings.Save();
+        SyncSettingsControls();
+    }
+
+    public void SetHeaderVisible(bool visible)
+    {
+        settings.ShowTitleBar = visible;
+        ApplyPadding();
+        UpdateHeaderVisibility();
+        if (visible && attachedToDesktop) EnsureStripBackdrop();
+        settings.Save();
+        SyncSettingsControls();
+    }
+
+    private void UpdateHeaderVisibility()
+    {
+        titleBar.SetLayoutUnlocked(isLayoutUnlocked && !isClickThrough);
+        if (!IsHandleCreated) return;
+        if (settings.ShowTitleBar)
+        {
+            if (!titleBar.Visible)
+            {
+                titleBar.Location = PointToScreen(Point.Empty);
+                titleBar.Show(this);
+            }
+            titleBar.Reposition();
+        }
+        else if (titleBar.Visible)
+            titleBar.Hide();
+    }
+
+    // When the title is hidden, the native system move command remains available
+    // from the tray/Settings; keyboard arrows move, Enter confirms, Escape cancels.
+    public void BeginKeyboardMove()
+    {
+        if (isClickThrough || !isLayoutUnlocked || !IsHandleCreated)
+            return;
+        bool restoreSettings = settingsForm is { Visible: true };
+        if (restoreSettings)
+            settingsForm!.Hide();
+        BeginInvoke(() =>
+        {
+            if (!IsDisposed && !isClickThrough && isLayoutUnlocked)
+            {
+                Activate();
+                NativeMethods.SendMessage(Handle, NativeMethods.WM_SYSCOMMAND,
+                    new IntPtr(NativeMethods.SC_MOVE), IntPtr.Zero);
+            }
+            if (restoreSettings && settingsForm is { IsDisposed: false })
+                settingsForm.ShowAndActivate();
+        });
+    }
+
+    private void SyncSettingsControls() =>
+        settingsForm?.SyncTrayOptions(!isClickThrough, isLayoutUnlocked,
+            settings.ShowTitleBar, settings.BehindDesktopIcons);
 
     private void SetClickThrough(bool enable)
     {
@@ -263,7 +343,9 @@ public class MainForm : Form
         }
         hoverPanel.UpdateState(enable);
         titleBar.UpdateState(enable, Opacity);
+        UpdateHeaderVisibility();
         titleBar.Reposition();
+        SyncSettingsControls();
         ApplyEdgeShadows();  // widget mode only: they'd hide content while interacting
         settings.Save();
     }
@@ -300,10 +382,34 @@ public class MainForm : Form
             return;
         }
 
+        // Lock both custom and native borderless resize affordances.
+        if (m.Msg == NativeMethods.WM_SYSCOMMAND && !isClickThrough && !isLayoutUnlocked)
+        {
+            int command = unchecked((int)(m.WParam.ToInt64() & 0xFFF0));
+            if (command is NativeMethods.SC_MOVE or NativeMethods.SC_SIZE
+                or NativeMethods.SC_MAXIMIZE ||
+                (command == NativeMethods.SC_RESTORE && NativeMethods.IsZoomed(Handle)))
+            {
+                m.Result = IntPtr.Zero;
+                return;
+            }
+        }
+
         // borderless resize: the padding frame around the webview doubles as resize grips
-        if (m.Msg == NativeMethods.WM_NCHITTEST && !isClickThrough && !NativeMethods.IsZoomed(Handle))
+        if (m.Msg == NativeMethods.WM_NCHITTEST && !isClickThrough)
         {
             base.WndProc(ref m);
+            if (!isLayoutUnlocked)
+            {
+                if ((int)m.Result is NativeMethods.HTCAPTION
+                    or NativeMethods.HTLEFT or NativeMethods.HTRIGHT
+                    or NativeMethods.HTTOP or NativeMethods.HTBOTTOM
+                    or NativeMethods.HTTOPLEFT or NativeMethods.HTTOPRIGHT
+                    or NativeMethods.HTBOTTOMLEFT or NativeMethods.HTBOTTOMRIGHT)
+                    m.Result = new IntPtr(NativeMethods.HTCLIENT);
+                return;
+            }
+            if (NativeMethods.IsZoomed(Handle)) return;
             if ((int)m.Result == NativeMethods.HTCLIENT)
             {
                 int x = unchecked((short)(long)m.LParam);
@@ -651,6 +757,7 @@ public class MainForm : Form
     public void SetBehindDesktopIcons(bool behind)
     {
         settings.BehindDesktopIcons = behind;
+        settingsForm?.SyncBehindDesktopIcons(behind);
         if (isClickThrough)
         {
             if (behind)
@@ -664,6 +771,7 @@ public class MainForm : Form
             }
         }
         settings.Save();
+        SyncSettingsControls();
     }
 
     public void SetCornerPanelEnabled(bool enabled)
@@ -823,21 +931,44 @@ public class MainForm : Form
     private void SetupTray()
     {
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Toggle interaction", null, (_, _) => ToggleClickThrough());
+        var headerItem = new ToolStripMenuItem("Show title bar", null,
+            (_, _) => SetHeaderVisible(!settings.ShowTitleBar));
+        var interactionItem = new ToolStripMenuItem("Enable calendar interaction", null,
+            (_, _) => ToggleClickThrough());
+        var layoutItem = new ToolStripMenuItem("Move / resize window", null,
+            (_, _) => SetLayoutEditing(!isLayoutUnlocked));
+        var moveItem = new ToolStripMenuItem("Move window (keyboard)…", null,
+            (_, _) => BeginKeyboardMove());
+        var behindItem = new ToolStripMenuItem("Behind desktop icons (live wallpaper)", null,
+            (_, _) => SetBehindDesktopIcons(!settings.BehindDesktopIcons));
+        menu.Items.Add(headerItem);
+        menu.Items.Add(interactionItem);
+        menu.Items.Add(layoutItem);
+        menu.Items.Add(moveItem);
+        menu.Items.Add(behindItem);
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Settings…", null, (_, _) => ShowSettings());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => Application.Exit());
-
+        menu.Opening += (_, _) =>
+        {
+            headerItem.Checked = settings.ShowTitleBar;
+            interactionItem.Checked = !isClickThrough;
+            layoutItem.Checked = isLayoutUnlocked;
+            moveItem.Enabled = !isClickThrough && isLayoutUnlocked;
+            behindItem.Checked = settings.BehindDesktopIcons;
+        };
         tray.Icon = Icon ?? SystemIcons.Application;
         tray.Text = "Google Calendar Desktop Widget";
         tray.ContextMenuStrip = menu;
         tray.Visible = true;
-        tray.DoubleClick += (_, _) => ShowSettings();
+        tray.DoubleClick += (_, _) => ToggleClickThrough();
     }
 
     public void ShowSettings()
     {
         settingsForm ??= new SettingsForm(this, settings);
+        SyncSettingsControls();
         settingsForm.ShowAndActivate();
     }
 

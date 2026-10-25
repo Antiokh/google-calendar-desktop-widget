@@ -53,6 +53,13 @@ Transparency, hover-panel corner, start-with-Windows, sign-out — all in one sm
 <img src="assets/panel.svg" width="100%" alt="The control panel with a transparency slider; dragging it fades the calendar between solid and ghost."/>
 </div>
 
+## Tray and window controls
+
+Right-click the tray icon to independently toggle calendar interaction, move/resize,
+the optional title bar and the experimental behind-desktop-icons mode. **Move / resize**
+is enabled by default and remembered across mode changes and restarts. When the title bar is hidden, use **Move window (keyboard)…** from the tray or Settings, move with the arrow keys, and press Enter. These options
+are also available in **Settings**. The tray keeps the application's original icon.
+
 ## 📥 Get it
 
 1. **[Download the latest installer](https://github.com/mkazemie/google-calendar-desktop-widget/releases/download/v1.3.0/CalendarWidgetSetup-1.3.0.exe)** (≈ 2 MB) and run it — it fetches anything else it needs automatically.

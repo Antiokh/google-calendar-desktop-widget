@@ -35,6 +35,7 @@ public class TitleBar : Form
     private readonly Button btnClose;
     private Theme theme = Theme.Dark;
     private bool clickThrough;
+    private bool layoutUnlocked = true;
     private int btnW = LogicalBtnW;
 
     /// <summary>Bar height in pixels at the bar's DPI; the owner reserves a strip this tall.</summary>
@@ -226,11 +227,13 @@ public class TitleBar : Form
         return b;
     }
 
+    public void SetLayoutUnlocked(bool enabled) => layoutUnlocked = enabled;
+
     private void StartDrag(object? sender, MouseEventArgs e)
     {
         // widget mode: the bar only hosts the toggle/settings buttons — the pinned
         // widget must not be movable or maximizable by accident
-        if (clickThrough || e.Button != MouseButtons.Left)
+        if (clickThrough || !layoutUnlocked || e.Button != MouseButtons.Left)
             return;
         if (e.Clicks == 2)
         {
