@@ -19,6 +19,10 @@ public class AppSettings
         set => Transparency = (int)Math.Round(255 * (100 - Math.Clamp(value, 0, 95)) / 100.0);
     }
 
+    // Layout options are independent of the interactive/pass-through mode.
+    public bool ShowTitleBar { get; set; } = true;
+    public bool LayoutUnlocked { get; set; } = true;
+
     // widget mode sits behind the desktop icons (live-wallpaper style, WorkerW reparenting)
     public bool BehindDesktopIcons { get; set; }
 
