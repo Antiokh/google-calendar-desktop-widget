@@ -28,6 +28,12 @@ public class SettingsForm : Form
     private readonly TrackBar sldAlpha;
     private readonly CheckBox cbBehind;
     private bool syncingBehindDesktopIcons;
+    private bool syncingTrayOptions;
+    private readonly CheckBox cbInteraction;
+    private readonly CheckBox cbLayout;
+    private readonly CheckBox cbTitleBar;
+    private readonly CheckBox cbStayDesktop;
+    private readonly CheckBox cbDateIcon;
     private readonly Label lblShadow = SectionLabel("EDGE SHADOWS");
     private readonly EdgeShadowSlider sldShadow;
     private readonly Label valShadowLeft = ValueLabel(ContentAlignment.TopLeft);
@@ -62,6 +68,7 @@ public class SettingsForm : Form
         MaximizeBox = false;
         ShowInTaskbar = false;
         TopMost = true;
+        AutoScroll = true; // Keep every tray option accessible on small/high-DPI displays.
         StartPosition = FormStartPosition.Manual;  // centered by ShowAndActivate / OnHandleCreated
         BackColor = Back;
         ForeColor = Fore;
@@ -81,6 +88,39 @@ public class SettingsForm : Form
         {
             valAlpha.Text = sldAlpha.Value + "%";
             main.SetTransparencyPercent(sldAlpha.Value);
+        };
+
+        // ---- independent tray/window options ----
+        cbInteraction = Check("Enable calendar interaction", main.CalendarInteractionEnabled);
+        cbInteraction.CheckedChanged += (_, _) =>
+        {
+            if (!syncingTrayOptions)
+                main.SetCalendarInteraction(cbInteraction.Checked);
+        };
+        cbLayout = Check("Move / resize window", settings.LayoutUnlocked);
+        cbLayout.CheckedChanged += (_, _) =>
+        {
+            if (!syncingTrayOptions)
+                main.SetLayoutEditing(cbLayout.Checked);
+        };
+        cbTitleBar = Check("Show title bar", settings.ShowTitleBar);
+        cbTitleBar.CheckedChanged += (_, _) =>
+        {
+            if (!syncingTrayOptions)
+                main.SetHeaderVisible(cbTitleBar.Checked);
+        };
+        cbStayDesktop = Check("Stay visible on Show Desktop (experimental)",
+            settings.KeepInteractiveVisibleOnDesktop);
+        cbStayDesktop.CheckedChanged += (_, _) =>
+        {
+            if (!syncingTrayOptions)
+                main.SetStayVisibleOnShowDesktop(cbStayDesktop.Checked);
+        };
+        cbDateIcon = Check("Show date in tray icon", settings.UseDateTrayIcon);
+        cbDateIcon.CheckedChanged += (_, _) =>
+        {
+            if (!syncingTrayOptions)
+                main.SetUseDateTrayIcon(cbDateIcon.Checked);
         };
 
         // ---- live-wallpaper mode ----
@@ -151,7 +191,8 @@ public class SettingsForm : Form
         btnAccount = ActionButton("Sign in", Fore);  // refreshed from the real cookie state whenever the form is shown
         btnAccount.Click += OnAccountClick;
 
-        Controls.AddRange([lblAlpha, valAlpha, sldAlpha, cbBehind, lblShadow, sldShadow, valShadowLeft, valShadowRight,
+        Controls.AddRange([lblAlpha, valAlpha, sldAlpha, cbInteraction, cbLayout, cbTitleBar,
+            cbStayDesktop, cbDateIcon, cbBehind, lblShadow, sldShadow, valShadowLeft, valShadowRight,
             lblCorner, cbCorner, cmbCorner, cbStartup, lblTip, btnDonate, btnExit, btnAccount]);
 
         LayoutForDpi(DeviceDpi);  // provisional (system DPI); redone once the window's monitor is known
@@ -197,6 +238,11 @@ public class SettingsForm : Form
         // the native trackbar insets its thumb travel; widen it so the track lines up with the text
         sldAlpha.SetBounds(x - S(6), y, w + S(12), 0);  // height: the trackbar's own (AutoSize)
         y += sldAlpha.Height + S(8);
+        y = Row(cbInteraction, x, y, w, 6);
+        y = Row(cbLayout, x, y, w, 6);
+        y = Row(cbTitleBar, x, y, w, 6);
+        y = Row(cbStayDesktop, x, y, w, 6);
+        y = Row(cbDateIcon, x, y, w, 10);
         y = Row(cbBehind, x, y, w, 20);
 
         y = Row(lblShadow, x, y, w, 4);
@@ -221,7 +267,12 @@ public class SettingsForm : Form
         btnAccount.SetBounds(x + w - bw, y, bw, S(36));
         y += S(36 + 16);
 
-        ClientSize = new Size(S(LogicalWidth), y);
+        var workingArea = IsHandleCreated
+            ? Screen.FromHandle(Handle).WorkingArea
+            : Screen.FromPoint(Cursor.Position).WorkingArea;
+        int maxHeight = Math.Max(S(250), workingArea.Height - S(90));
+        AutoScrollMinSize = new Size(0, y);
+        ClientSize = new Size(S(LogicalWidth), Math.Min(y, maxHeight));
         ResumeLayout();
     }
 
@@ -263,6 +314,25 @@ public class SettingsForm : Form
     /// Update the Settings checkbox when changed from the tray, including
     /// while this dialog is open, without echoing a CheckedChanged write.
     /// </summary>
+    public void SyncTrayOptions(bool interaction, bool layout, bool titleBar,
+        bool behind, bool showDesktop, bool dateIcon)
+    {
+        syncingTrayOptions = true;
+        try
+        {
+            cbInteraction.Checked = interaction;
+            cbLayout.Checked = layout;
+            cbTitleBar.Checked = titleBar;
+            cbStayDesktop.Checked = showDesktop;
+            cbDateIcon.Checked = dateIcon;
+        }
+        finally
+        {
+            syncingTrayOptions = false;
+        }
+        SyncBehindDesktopIcons(behind);
+    }
+
     public void SyncBehindDesktopIcons(bool behind)
     {
         if (IsDisposed || cbBehind.Checked == behind)
