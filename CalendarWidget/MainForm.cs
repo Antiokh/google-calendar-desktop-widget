@@ -101,12 +101,19 @@ public class MainForm : Form
     {
         base.OnLocationChanged(e);
         titleBar?.Reposition();
+        // Win+Arrow / Aero Snap may change position without OnResizeEnd.
+        // Cache it now; persist to disk at exit or explicit layout actions.
+        if (IsHandleCreated)
+            SaveBounds();
     }
 
     protected override void OnSizeChanged(EventArgs e)
     {
         base.OnSizeChanged(e);
         titleBar?.Reposition();
+        // Capture keyboard/system maximize, restore and snap transitions.
+        if (IsHandleCreated)
+            SaveBounds();
     }
 
     protected override void OnResizeEnd(EventArgs e)
@@ -1050,14 +1057,20 @@ public class MainForm : Form
         settings.WinMaximized = WindowState == FormWindowState.Maximized;
     }
 
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        // Called while the HWND and RestoreBounds still exist. The SaveBounds
+        // guard protects wallpaper child coordinates and minimized state.
+        // Unlike the former passive-only close path, this includes an
+        // interactive window maximized/snapped with Win+Arrow.
+        SaveBounds();
+        settings.Save();
+        base.OnFormClosing(e);
+    }
+
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         hoverPoll.Stop();
-        // while attached, Bounds are WorkerW-relative and the window can't have moved
-        // since attach anyway — the entering-widget-mode SaveBounds already captured them
-        if (isClickThrough && !attachedToDesktop)
-            SaveBounds();
-        settings.Save();
         tray.Visible = false;
         tray.Dispose();
         base.OnFormClosed(e);
