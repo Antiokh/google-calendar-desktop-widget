@@ -36,14 +36,14 @@ public class MainForm : Form
     private Theme theme;                  // chrome colors, following the calendar page's background
     private bool isClickThrough;           // effective OS-level pass-through state
     private bool calendarInteractionEnabled; // the user's independent interaction preference
-    private bool isLayoutUnlocked;         // temporarily reveal the header for dragging in interactive mode
+    private bool isLayoutUnlocked;         // persisted layout setting, effective only in interactive mode
     private bool nativeMoveSizeActive;      // suspend watchdog offscreen recovery during user drag/resize
     private bool previewLook;             // interactive mode showing the widget look while Settings is open
     private DateTime? hoverHideDeadline;  // set while the panel is visible but the mouse has left it
     private int guardTick;                // periodic re-assert of click-through styles
     private int styleBurst;               // fast re-assert right after enabling (Chrome recreates windows)
     private int attachCheckTick;          // throttle for the behind-icons re-attach watchdog
-    private int topLevelGeometryCheckTick;
+    private int passiveZOrderCheckTick;
     private bool desktopDiscoveryInFlight;
     private int desktopDiscoveryFailures;
     private long nextDesktopDiscoveryAt;
@@ -252,7 +252,7 @@ public class MainForm : Form
     {
         // When the title bar is hidden, its strip belongs to the calendar.
         // Layout mode temporarily reveals the bar as a safe drag handle.
-        int top = settings.ShowTitleBar || isLayoutUnlocked ? titleBar.BarHeight : 0;
+        int top = settings.ShowTitleBar || (isLayoutUnlocked && !isClickThrough) ? titleBar.BarHeight : 0;
         if (isClickThrough)
             return new Padding(0, top, 0, 0);
         int frame = isLayoutUnlocked ? LogicalToDeviceUnits(6) : 0;
@@ -265,7 +265,7 @@ public class MainForm : Form
         if (stripBackdrop is not null)
         {
             // Do not leave an empty painted strip after removing the header.
-            stripBackdrop.Visible = settings.ShowTitleBar && !isLayoutUnlocked;
+            stripBackdrop.Visible = settings.ShowTitleBar && isClickThrough;
             stripBackdrop.SetBounds(0, 0, ClientSize.Width,
                 stripBackdrop.Visible ? titleBar.BarHeight : 0);
         }
@@ -344,7 +344,7 @@ public class MainForm : Form
             WindowState = FormWindowState.Maximized;
 
         // Keep the sign-in experience interactive on the very first run.
-        // Layout unlock is intentionally session-only, never restored at startup.
+        isLayoutUnlocked = settings.LayoutUnlocked;
         calendarInteractionEnabled = firstRun;
         ApplyInteractionModes();
         if (firstRun)
@@ -380,28 +380,36 @@ public class MainForm : Form
 
     // ---------------- click-through / interactive ----------------
 
-    public void ToggleClickThrough()
+    public bool CalendarInteractionEnabled => calendarInteractionEnabled;
+    public bool LayoutUnlocked => isLayoutUnlocked;
+
+    public void ToggleClickThrough() => SetCalendarInteraction(!calendarInteractionEnabled);
+
+    public void SetCalendarInteraction(bool enabled)
     {
-        calendarInteractionEnabled = !calendarInteractionEnabled;
-        // Layout controls are only available while the calendar is interactive.
-        if (!calendarInteractionEnabled)
-            isLayoutUnlocked = false;
+        if (calendarInteractionEnabled == enabled)
+            return;
+        calendarInteractionEnabled = enabled;
         ApplyInteractionModes();
     }
 
-    private void ToggleLayoutEditing()
-    {
-        if (!calendarInteractionEnabled || isClickThrough)
-            return;
+    private void ToggleLayoutEditing() => SetLayoutEditing(!isLayoutUnlocked);
 
-        // This only reveals the title bar as a drag handle. Browser interaction
-        // stays enabled and resizing is handled by the normal window frame.
-        isLayoutUnlocked = !isLayoutUnlocked;
+    public void SetLayoutEditing(bool unlocked)
+    {
+        if (isLayoutUnlocked == unlocked)
+            return;
+        // Store the requested preference even while pass-through is active;
+        // the actual drag and resize affordances are active in interactive mode only.
+        isLayoutUnlocked = unlocked;
+        settings.LayoutUnlocked = unlocked;
         ApplyPadding();
         UpdateHeaderVisibility();
+        settings.Save();
+        SyncSettingsControls();
     }
 
-    private void SetHeaderVisible(bool visible)
+    public void SetHeaderVisible(bool visible)
     {
         settings.ShowTitleBar = visible;
         ApplyPadding();
@@ -409,6 +417,7 @@ public class MainForm : Form
         if (visible && attachedToDesktop)
             EnsureStripBackdrop();
         settings.Save();
+        SyncSettingsControls();
     }
 
     private void UpdateHeaderVisibility()
@@ -416,7 +425,7 @@ public class MainForm : Form
         titleBar.SetLayoutUnlocked(isLayoutUnlocked && !isClickThrough);
         if (!IsHandleCreated)
             return;
-        if (settings.ShowTitleBar || isLayoutUnlocked)
+        if (settings.ShowTitleBar || (isLayoutUnlocked && !isClickThrough))
         {
             if (!titleBar.Visible)
             {
@@ -438,12 +447,11 @@ public class MainForm : Form
     /// </summary>
     private void ApplyInteractionModes()
     {
-        if (!calendarInteractionEnabled)
-            isLayoutUnlocked = false;
         SetClickThrough(!calendarInteractionEnabled);
         UpdateHeaderVisibility();
         ApplyPadding();
         RefreshTrayIcon();
+        SyncSettingsControls();
     }
 
     private void SetClickThrough(bool enable)
@@ -754,9 +762,8 @@ public class MainForm : Form
     // HWND_BOTTOM used to bury the form during opacity/DPI/reparent updates.
     protected override void WndProc(ref Message m)
     {
-        // A user can temporarily drag/resize a window beyond the work area.
-        // Never let the 1s offscreen watchdog fight the native move/size loop.
-        // Reconciliation resumes on the next watchdog tick after the loop.
+        // A user can intentionally drag/resize beyond the work area. Offscreen
+        // reconciliation is event-driven (startup/display changes), never polled.
         if (m.Msg == NativeMethods.WM_ENTERSIZEMOVE)
             nativeMoveSizeActive = true;
         else if (m.Msg == NativeMethods.WM_EXITSIZEMOVE)
@@ -1418,10 +1425,7 @@ public class MainForm : Form
             return;
         if (attachedToDesktop && NativeMethods.IsWorkerW(attachedWorkerW) &&
             NativeMethods.HasParent(Handle, attachedWorkerW))
-        {
-            ReconcileAttachedGeometry();
             return;
-        }
 
         // Honor the same retry gate for a failed orphan detach as for failed
         // discovery/attachment. Otherwise the 1s watchdog bypasses backoff.
@@ -1551,6 +1555,7 @@ public class MainForm : Form
         if (settings.BehindDesktopIcons && isClickThrough)
         {
             ReconcileUnattachedWallpaperFallback();
+            ReconcileAttachedGeometry();
             EnsureDesktopAttachment();
         }
         else
@@ -1595,6 +1600,7 @@ public class MainForm : Form
                 NativeMethods.PlacePassiveAboveDesktop(Handle);
         }
         settings.Save();
+        SyncSettingsControls();
     }
 
     public void SetCornerPanelEnabled(bool enabled)
@@ -1662,21 +1668,12 @@ public class MainForm : Form
             showDesktopPoll = 0;
             MaintainInteractiveDesktopVisibility();
         }
-        // Monitor notifications can arrive before WinForms' screen list is
-        // updated. Independently verify ordinary top-level visibility every
-        // second without moving fully visible or intentionally spanning windows.
-        if (++topLevelGeometryCheckTick >= 10)
+        // Z-order recovery is separate from offscreen geometry recovery.
+        // Explorer can bury the passive top-level window even without a display
+        // change; only restore it when genuinely below the desktop surface.
+        if (++passiveZOrderCheckTick >= 10)
         {
-            topLevelGeometryCheckTick = 0;
-            if (settings.BehindDesktopIcons && isClickThrough)
-                ReconcileUnattachedWallpaperFallback();
-            else
-                ReconcileTopLevelGeometry();
-
-            // Explorer may reorder windows when the calendar relinquishes
-            // foreground focus. Recover only if a passive top-level fallback
-            // actually fell BELOW the desktop. Attached WorkerW children are
-            // never repositioned by this top-level guard.
+            passiveZOrderCheckTick = 0;
             if (isClickThrough && !attachedToDesktop &&
                 !reparentInProgress && !desktopDiscoveryInFlight &&
                 IsHandleCreated && !NativeMethods.IsIconic(Handle))
@@ -1809,35 +1806,16 @@ public class MainForm : Form
         var behindIconsItem = new ToolStripMenuItem("Behind desktop icons (live wallpaper)", null,
             (_, _) => SetBehindDesktopIcons(!settings.BehindDesktopIcons));
         var showDesktopItem = new ToolStripMenuItem("Stay visible on Show Desktop (experimental)", null,
-            (_, _) =>
-            {
-                settings.KeepInteractiveVisibleOnDesktop = !settings.KeepInteractiveVisibleOnDesktop;
-                settings.Save();
-                if (!settings.KeepInteractiveVisibleOnDesktop)
-                {
-                    // An explicit opt-out is NOT a reverse Win+D gesture.
-                    // HWND_NOTOPMOST alone leaves us above ordinary windows,
-                    // potentially still covering the desktop. After clearing
-                    // TOPMOST, deliberately return to the normal background
-                    // position so the option takes effect immediately.
-                    ReleaseInteractiveDesktopPromotion();
-                    if (!isClickThrough && IsHandleCreated)
-                    {
-                        NativeMethods.SendToBottom(Handle);
-                        interactiveDesktopTopmost = NativeMethods.IsTopmost(Handle);
-                    }
-                }
-                else
-                {
-                    MaintainInteractiveDesktopVisibility();
-                }
-            });
+            (_, _) => SetStayVisibleOnShowDesktop(!settings.KeepInteractiveVisibleOnDesktop));
+        var dateIconItem = new ToolStripMenuItem("Show date in tray icon", null,
+            (_, _) => SetUseDateTrayIcon(!settings.UseDateTrayIcon));
 
         menu.Items.Add(headerItem);
         menu.Items.Add(interactionItem);
         menu.Items.Add(layoutItem);
         menu.Items.Add(behindIconsItem);
         menu.Items.Add(showDesktopItem);
+        menu.Items.Add(dateIconItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Settings…", null, (_, _) => ShowSettings());
         menu.Items.Add(new ToolStripSeparator());
@@ -1850,12 +1828,12 @@ public class MainForm : Form
             behindIconsItem.Text = pendingWallpaperDetach
                 ? "Behind desktop icons (disabling…)" : "Behind desktop icons (live wallpaper)";
             showDesktopItem.Checked = settings.KeepInteractiveVisibleOnDesktop;
+            dateIconItem.Checked = settings.UseDateTrayIcon;
             interactionItem.Checked = calendarInteractionEnabled;  // desired choice
             interactionItem.Text = pendingInteractiveDetach
                 ? "Enable calendar interaction (retrying…)" : "Enable calendar interaction";
             layoutItem.Checked = isLayoutUnlocked;
-            layoutItem.Enabled = calendarInteractionEnabled && !isClickThrough;
-            layoutItem.Text = isLayoutUnlocked ? "Finish moving / resizing" : "Move / resize window";
+            layoutItem.Text = isLayoutUnlocked ? "Lock move / resize" : "Move / resize window";
         };
 
         tray.ContextMenuStrip = menu;
@@ -1863,6 +1841,40 @@ public class MainForm : Form
         tray.Visible = true;
         tray.DoubleClick += (_, _) => ToggleClickThrough();
     }
+
+    public void SetStayVisibleOnShowDesktop(bool enabled)
+    {
+        settings.KeepInteractiveVisibleOnDesktop = enabled;
+        settings.Save();
+        if (!enabled)
+        {
+            // An explicit opt-out needs an actual demotion, not only NOTOPMOST.
+            ReleaseInteractiveDesktopPromotion();
+            if (!isClickThrough && IsHandleCreated)
+            {
+                NativeMethods.SendToBottom(Handle);
+                interactiveDesktopTopmost = NativeMethods.IsTopmost(Handle);
+            }
+        }
+        else
+            MaintainInteractiveDesktopVisibility();
+        SyncSettingsControls();
+    }
+
+    public void SetUseDateTrayIcon(bool enabled)
+    {
+        if (settings.UseDateTrayIcon == enabled)
+            return;
+        settings.UseDateTrayIcon = enabled;
+        settings.Save();
+        RefreshTrayIcon();
+        SyncSettingsControls();
+    }
+
+    private void SyncSettingsControls() =>
+        settingsForm?.SyncTrayOptions(calendarInteractionEnabled, isLayoutUnlocked,
+            settings.ShowTitleBar, settings.BehindDesktopIcons,
+            settings.KeepInteractiveVisibleOnDesktop, settings.UseDateTrayIcon);
 
     /// <summary>
     /// Render only a large date in the Windows taskbar's foreground color.
@@ -1876,6 +1888,13 @@ public class MainForm : Form
         string status = pendingInteractiveDetach
             ? "Switching to interactive" : effectivelyInteractive ? "Interactive" : "Wallpaper";
         tray.Text = $"Google Calendar - {today:dd MMM yyyy} - " + status;
+        if (!settings.UseDateTrayIcon)
+        {
+            tray.Icon = Icon ?? SystemIcons.Application;
+            renderedTrayIcon?.Dispose();
+            renderedTrayIcon = null;
+            return;
+        }
         Color ink = TrayIconRenderer.GetTaskbarTextColor();
         if (renderedTrayIcon is not null
             && renderedTrayDate == today
@@ -1906,6 +1925,7 @@ public class MainForm : Form
     public void ShowSettings()
     {
         settingsForm ??= new SettingsForm(this, settings);
+        SyncSettingsControls();
         settingsForm.ShowAndActivate();
     }
 
