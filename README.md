@@ -53,6 +53,20 @@ Transparency, hover-panel corner, start-with-Windows, sign-out — all in one sm
 <img src="assets/panel.svg" width="100%" alt="The control panel with a transparency slider; dragging it fades the calendar between solid and ghost."/>
 </div>
 
+## Tray controls
+
+Right-click the tray icon to switch calendar interaction, show or hide the title bar,
+unlock window movement and resizing, place the passive calendar behind desktop icons,
+or optionally keep the interactive calendar visible after Windows **Show Desktop**.
+**Move / resize** is enabled by default and remembered across mode changes and restarts.
+The original app icon remains the default; enable the **date tray icon** if you prefer
+to see the current day (regular numerals in wallpaper mode, bold when interactive).
+All these choices are also available in **Settings**.
+
+The Behind desktop icons and Show Desktop options rely on Windows Explorer window
+behavior; test their behavior if using multiple monitors or custom shell software.
+The date indicator follows the Windows system taskbar light/dark setting.
+
 ## 📥 Get it
 
 1. **[Download the latest installer](https://github.com/mkazemie/google-calendar-desktop-widget/releases/download/v1.3.0/CalendarWidgetSetup-1.3.0.exe)** (≈ 2 MB) and run it — it fetches anything else it needs automatically.
