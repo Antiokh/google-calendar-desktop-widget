@@ -21,6 +21,11 @@ public class SettingsForm : Form
     private const int Gutter = 20;         // left/right margin
 
     private readonly MainForm main;
+    private bool syncingTrayOptions;
+    private bool syncingBehindDesktopIcons;
+    private readonly CheckBox cbInteraction;
+    private readonly CheckBox cbLayout;
+    private readonly CheckBox cbTitleBar;
 
     private readonly Label lblAlpha = SectionLabel("TRANSPARENCY");
     private readonly Label valAlpha = ValueLabel(ContentAlignment.TopRight);
@@ -59,6 +64,7 @@ public class SettingsForm : Form
         MaximizeBox = false;
         ShowInTaskbar = false;
         TopMost = true;
+        AutoScroll = true;
         StartPosition = FormStartPosition.Manual;  // centered by ShowAndActivate / OnHandleCreated
         BackColor = Back;
         ForeColor = Fore;
@@ -80,9 +86,28 @@ public class SettingsForm : Form
             main.SetTransparencyPercent(sldAlpha.Value);
         };
 
+        cbInteraction = Check("Enable calendar interaction", main.CalendarInteractionEnabled);
+        cbInteraction.CheckedChanged += (_, _) =>
+        {
+            if (!syncingTrayOptions) main.SetCalendarInteraction(cbInteraction.Checked);
+        };
+        cbLayout = Check("Move / resize window", settings.LayoutUnlocked);
+        cbLayout.CheckedChanged += (_, _) =>
+        {
+            if (!syncingTrayOptions) main.SetLayoutEditing(cbLayout.Checked);
+        };
+        cbTitleBar = Check("Show title bar", settings.ShowTitleBar);
+        cbTitleBar.CheckedChanged += (_, _) =>
+        {
+            if (!syncingTrayOptions) main.SetHeaderVisible(cbTitleBar.Checked);
+        };
+
         // ---- live-wallpaper mode ----
         cbBehind = Check("Sit behind desktop icons (live wallpaper)", settings.BehindDesktopIcons);
-        cbBehind.CheckedChanged += (_, _) => main.SetBehindDesktopIcons(cbBehind.Checked);
+        cbBehind.CheckedChanged += (_, _) =>
+        {
+            if (!syncingBehindDesktopIcons) main.SetBehindDesktopIcons(cbBehind.Checked);
+        };
 
         // ---- edge shadows: dark fades behind desktop icons ----
         sldShadow = new EdgeShadowSlider
@@ -144,7 +169,7 @@ public class SettingsForm : Form
         btnAccount = ActionButton("Sign in", Fore);  // refreshed from the real cookie state whenever the form is shown
         btnAccount.Click += OnAccountClick;
 
-        Controls.AddRange([lblAlpha, valAlpha, sldAlpha, cbBehind, lblShadow, sldShadow, valShadowLeft, valShadowRight,
+        Controls.AddRange([lblAlpha, valAlpha, sldAlpha, cbInteraction, cbLayout, cbTitleBar, cbBehind, lblShadow, sldShadow, valShadowLeft, valShadowRight,
             lblCorner, cbCorner, cmbCorner, cbStartup, lblTip, btnDonate, btnExit, btnAccount]);
 
         LayoutForDpi(DeviceDpi);  // provisional (system DPI); redone once the window's monitor is known
@@ -190,6 +215,9 @@ public class SettingsForm : Form
         // the native trackbar insets its thumb travel; widen it so the track lines up with the text
         sldAlpha.SetBounds(x - S(6), y, w + S(12), 0);  // height: the trackbar's own (AutoSize)
         y += sldAlpha.Height + S(8);
+        y = Row(cbInteraction, x, y, w, 6);
+        y = Row(cbLayout, x, y, w, 6);
+        y = Row(cbTitleBar, x, y, w, 6);
         y = Row(cbBehind, x, y, w, 20);
 
         y = Row(lblShadow, x, y, w, 4);
@@ -214,7 +242,10 @@ public class SettingsForm : Form
         btnAccount.SetBounds(x + w - bw, y, bw, S(36));
         y += S(36 + 16);
 
-        ClientSize = new Size(S(LogicalWidth), y);
+        var wa = IsHandleCreated ? Screen.FromHandle(Handle).WorkingArea
+            : Screen.FromPoint(Cursor.Position).WorkingArea;
+        AutoScrollMinSize = new Size(0, y);
+        ClientSize = new Size(S(LogicalWidth), Math.Min(y, Math.Max(S(250), wa.Height - S(90))));
         ResumeLayout();
     }
 
@@ -250,6 +281,28 @@ public class SettingsForm : Form
         base.OnDpiChanged(e);
         LayoutForDpi(e.DeviceDpiNew);
         Location = e.SuggestedRectangle.Location;
+    }
+
+    public void SyncTrayOptions(bool interaction, bool layout, bool titleBar, bool behind)
+    {
+        if (IsDisposed) return;
+        syncingTrayOptions = true;
+        try
+        {
+            cbInteraction.Checked = interaction;
+            cbLayout.Checked = layout;
+            cbTitleBar.Checked = titleBar;
+        }
+        finally { syncingTrayOptions = false; }
+        SyncBehindDesktopIcons(behind);
+    }
+
+    public void SyncBehindDesktopIcons(bool behind)
+    {
+        if (IsDisposed || cbBehind.Checked == behind) return;
+        syncingBehindDesktopIcons = true;
+        try { cbBehind.Checked = behind; }
+        finally { syncingBehindDesktopIcons = false; }
     }
 
     protected override void OnVisibleChanged(EventArgs e)
