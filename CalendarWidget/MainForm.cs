@@ -1782,10 +1782,11 @@ public class MainForm : Form
 
     private void EnsureInteractive()
     {
-        if (!calendarInteractionEnabled || isLayoutUnlocked)
+        if (!calendarInteractionEnabled)
         {
+            // Showing the sign-in/editor must not overwrite the user's saved
+            // move/resize preference.
             calendarInteractionEnabled = true;
-            isLayoutUnlocked = false;
             ApplyInteractionModes();
         }
         if (!isClickThrough)
