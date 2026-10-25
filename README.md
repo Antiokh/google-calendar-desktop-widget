@@ -57,7 +57,7 @@ Transparency, hover-panel corner, start-with-Windows, sign-out — all in one sm
 
 Right-click the tray icon to independently toggle calendar interaction, move/resize,
 the optional title bar and the experimental behind-desktop-icons mode. **Move / resize**
-is enabled by default and remembered across mode changes and restarts. These options
+is enabled by default and remembered across mode changes and restarts. When the title bar is hidden, use **Move window (keyboard)…** from the tray or Settings, move with the arrow keys, and press Enter. These options
 are also available in **Settings**. The tray keeps the application's original icon.
 
 ## 📥 Get it
