@@ -36,6 +36,7 @@ public class MainForm : Form
     private int guardTick;                // periodic re-assert of click-through styles
     private int styleBurst;               // fast re-assert right after enabling (Chrome recreates windows)
     private int attachCheckTick;
+    private int passiveZOrderCheckTick;
     private bool nativeMoveSizeActive;
     private bool desktopDiscoveryInFlight;
     private int desktopDiscoveryFailures;
@@ -392,7 +393,7 @@ public class MainForm : Form
             // catch any window Chrome recreates asynchronously — only this window's tree
             // goes transparent; the owned TitleBar stays clickable.
             SetOpacity(settings.Transparency / 255.0);
-            NativeMethods.SendToBottom(Handle);
+            NativeMethods.PlacePassiveAboveDesktop(Handle);
             if (settings.BehindDesktopIcons)
                 AttachToDesktop();
         }
@@ -427,22 +428,14 @@ public class MainForm : Form
         settings.Save();
     }
 
-    // pin the window to the bottom of the Z-order: any attempt to raise it
-    // (taskbar click, alt-tab, shell repositioning) is rewritten to HWND_BOTTOM
+    // Passive windows are positioned relative to Explorer's desktop layer.
+    // Do not rewrite arbitrary WM_WINDOWPOSCHANGING events to HWND_BOTTOM.
     protected override void WndProc(ref Message m)
     {
         if (m.Msg == NativeMethods.WM_ENTERSIZEMOVE)
             nativeMoveSizeActive = true;
         else if (m.Msg == NativeMethods.WM_EXITSIZEMOVE)
             nativeMoveSizeActive = false;
-
-        if (m.Msg == NativeMethods.WM_WINDOWPOSCHANGING && isClickThrough && m.LParam != IntPtr.Zero)
-        {
-            var wp = Marshal.PtrToStructure<NativeMethods.WINDOWPOS>(m.LParam);
-            wp.hwndInsertAfter = NativeMethods.HWND_BOTTOM;
-            wp.flags &= ~NativeMethods.SWP_NOZORDER;
-            Marshal.StructureToPtr(wp, m.LParam, false);
-        }
 
         // claim the caption/frame area as client: removes the native title bar visuals
         // while keeping the WS_CAPTION/WS_THICKFRAME behaviors (snap, maximize).
@@ -532,7 +525,7 @@ public class MainForm : Form
         if (isClickThrough)
         {
             NativeMethods.AddExStyle(Handle, NativeMethods.WS_EX_TRANSPARENT | NativeMethods.WS_EX_NOACTIVATE);
-            NativeMethods.SendToBottom(Handle);
+            NativeMethods.PlacePassiveAboveDesktop(Handle);
         }
     }
 
@@ -1246,7 +1239,7 @@ public class MainForm : Form
         }
         pendingWallpaperDetach = false;
         ResetDesktopDiscoveryBackoff();
-        NativeMethods.SendToBottom(Handle);
+        NativeMethods.PlacePassiveAboveDesktop(Handle);
     }
 
     public void SetBehindDesktopIcons(bool behind)
@@ -1265,7 +1258,7 @@ public class MainForm : Form
                 RecordDesktopDiscoveryFailure();
             }
             else
-                NativeMethods.SendToBottom(Handle);
+                NativeMethods.PlacePassiveAboveDesktop(Handle);
         }
         settings.Save();
         SyncSettingsControls();
@@ -1344,8 +1337,6 @@ public class MainForm : Form
 
     private void CheckMouseHover()
     {
-        // This is not gated by click-through or wallpaper mode: a successful
-        // detach may need a delayed WS_POPUP/frame repair in interactive mode.
         RetryTopLevelStyleRepair();
         // Retry failed worker-parent detach without sacrificing safe click-through.
         if (pendingInteractiveDetach && !isClickThrough == false &&
@@ -1354,6 +1345,17 @@ public class MainForm : Form
         else if (pendingWallpaperDetach && isClickThrough &&
                  Environment.TickCount64 >= nextDesktopDiscoveryAt)
             RetryPendingWallpaperDetach();
+
+        // Recover only if Explorer actually buried the passive top-level HWND.
+        // Geometry recovery is independent and remains display-event-driven.
+        if (++passiveZOrderCheckTick >= 10)
+        {
+            passiveZOrderCheckTick = 0;
+            if (isClickThrough && !attachedToDesktop &&
+                !reparentInProgress && !desktopDiscoveryInFlight &&
+                IsHandleCreated && !NativeMethods.IsIconic(Handle))
+                NativeMethods.PlacePassiveAboveDesktop(Handle, onlyIfHidden: true);
+        }
 
         // interactive mode: controls are integrated in the title bar; the corner panel only
         // shows as a settings preview, which just has to time out

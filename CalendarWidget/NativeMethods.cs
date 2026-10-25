@@ -16,6 +16,7 @@ internal static class NativeMethods
 
     public const long WS_EX_TRANSPARENT = 0x00000020;  // mouse passes through
     public const long WS_EX_NOACTIVATE = 0x08000000;   // never steals keyboard focus
+    public const long WS_EX_TOPMOST = 0x00000008;
 
     public const int WM_WINDOWPOSCHANGING = 0x0046;
     public const int WM_ENTERSIZEMOVE = 0x0231;
@@ -104,18 +105,44 @@ internal static class NativeMethods
         applied.Clear();
     }
 
-    public static void SendToBottom(IntPtr hwnd) =>
+    public static bool SendToBottom(IntPtr hwnd) =>
         SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE_NOMOVE_NOACTIVATE);
+
+    /// <summary>Read the OS state rather than trusting our last SetWindowPos call.</summary>
+    public static bool IsTopmost(IntPtr hwnd) =>
+        (GetWindowLongPtr(hwnd, GWL_EXSTYLE).ToInt64() & WS_EX_TOPMOST) != 0;
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsIconic(IntPtr hwnd);
 
     // ---- live-wallpaper mode: reparent the widget behind the desktop icons ----
 
     private const uint GA_PARENT = 1;
+    private const uint GA_ROOTOWNER = 3;
+    private const uint GW_HWNDNEXT = 2;
+    private const uint GW_HWNDPREV = 3;
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetDesktopWindow();
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    /// <summary>Resolve dialogs to their owning application for safe passive placement.</summary>
+    public static IntPtr RootOwner(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) return IntPtr.Zero;
+        var root = GetAncestor(hwnd, GA_ROOTOWNER);
+        return root != IntPtr.Zero && IsWindow(root) ? root : hwnd;
+    }
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetDesktopWindow();
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
@@ -237,11 +264,102 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     public static extern bool IsWindow(IntPtr hWnd);
 
+    /// <summary>
+    /// Keep a top-level click-through calendar behind ordinary application
+    /// windows but ABOVE Explorer's desktop surface. HWND_BOTTOM does not
+    /// guarantee the latter and can make the widget completely disappear.
+    /// Never reorder WorkerW children; their native parent determines the
+    /// proper layer behind the desktop icons.
+    /// </summary>
+    public static bool PlacePassiveAboveDesktop(IntPtr hwnd, bool onlyIfHidden = false)
+    {
+        if (hwnd == IntPtr.Zero || !IsWindow(hwnd) ||
+            GetAncestor(hwnd, GA_PARENT) != GetDesktopWindow())
+            return false;
+
+        // EnumWindows walks the top-level Z-order from front to back. The
+        // first visible Progman/WorkerW is the top desktop shell layer; placing
+        // immediately above it keeps the widget visible without covering apps.
+        IntPtr desktop = IntPtr.Zero;
+        EnumWindows((candidate, _) =>
+        {
+            if (candidate != hwnd && IsWindowVisible(candidate) &&
+                IsDesktopForeground(candidate))
+            {
+                desktop = candidate;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+
+        if (desktop == IntPtr.Zero)
+            return false; // don't blindly fall back to HWND_BOTTOM
+
+        // Also recover a passive window incorrectly raised above the active
+        // ordinary application's root owner, without fighting correctly ordered
+        // windows or touching WorkerW children.
+        if (onlyIfHidden && IsAboveInZOrder(hwnd, desktop))
+        {
+            IntPtr foreground = GetForegroundWindow();
+            if (foreground == IntPtr.Zero || foreground == hwnd ||
+                IsDesktopForeground(foreground))
+                return true;
+            IntPtr appRoot = RootOwner(foreground);
+            if (appRoot == IntPtr.Zero || appRoot == hwnd || IsTopmost(appRoot) ||
+                !IsAboveInZOrder(hwnd, appRoot))
+                return true;
+            return SetWindowPos(hwnd, appRoot, 0, 0, 0, 0,
+                SWP_NOSIZE_NOMOVE_NOACTIVATE);
+        }
+
+        IntPtr beforeDesktop = GetWindow(desktop, GW_HWNDPREV);
+        if (beforeDesktop == hwnd)
+            return true; // already exactly above the desktop layer
+        // IntPtr.Zero is HWND_TOP in SetWindowPos, not "before desktop".
+        // If the desktop is already first, never promote a passive window
+        // over ordinary apps simply to force its relative placement.
+        if (beforeDesktop == IntPtr.Zero)
+            return false;
+        if (IsTopmost(beforeDesktop))
+            return false; // do not accidentally promote into the topmost band
+
+        return SetWindowPos(hwnd, beforeDesktop, 0, 0, 0, 0,
+            SWP_NOSIZE_NOMOVE_NOACTIVATE);
+    }
+
+    public static bool IsAboveInZOrder(IntPtr upper, IntPtr lower)
+    {
+        if (upper == IntPtr.Zero || lower == IntPtr.Zero || upper == lower ||
+            !IsWindow(upper) || !IsWindow(lower))
+            return false;
+
+        var current = upper;
+        for (int i = 0; i < 1024; i++)
+        {
+            current = GetWindow(current, GW_HWNDNEXT);
+            if (current == IntPtr.Zero)
+                return false;
+            if (current == lower)
+                return true;
+        }
+        return false;
+    }
+
     [DllImport("user32.dll")]
     public static extern bool ScreenToClient(IntPtr hWnd, ref Point point);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetClassNameW(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+
+    /// <summary>Win+D / Show Desktop activates the Explorer desktop window.</summary>
+    public static bool IsDesktopForeground(IntPtr window)
+    {
+        if (window == IntPtr.Zero || !IsWindow(window))
+            return false;
+        var cls = new System.Text.StringBuilder(32);
+        GetClassNameW(window, cls, cls.Capacity);
+        return cls.ToString() is "Progman" or "WorkerW";
+    }
 
     /// <summary>Is this handle a live WorkerW? Used to detect when the shell recreated it and orphaned us.</summary>
     public static bool IsWorkerW(IntPtr hwnd)
