@@ -25,6 +25,7 @@ public class SettingsForm : Form
     private bool syncingBehindDesktopIcons;
     private readonly CheckBox cbInteraction;
     private readonly CheckBox cbLayout;
+    private readonly Button btnMove;
     private readonly CheckBox cbTitleBar;
 
     private readonly Label lblAlpha = SectionLabel("TRANSPARENCY");
@@ -96,6 +97,8 @@ public class SettingsForm : Form
         {
             if (!syncingTrayOptions) main.SetLayoutEditing(cbLayout.Checked);
         };
+        btnMove = ActionButton("Move window (keyboard)…", Fore);
+        btnMove.Click += (_, _) => main.BeginKeyboardMove();
         cbTitleBar = Check("Show title bar", settings.ShowTitleBar);
         cbTitleBar.CheckedChanged += (_, _) =>
         {
@@ -169,7 +172,7 @@ public class SettingsForm : Form
         btnAccount = ActionButton("Sign in", Fore);  // refreshed from the real cookie state whenever the form is shown
         btnAccount.Click += OnAccountClick;
 
-        Controls.AddRange([lblAlpha, valAlpha, sldAlpha, cbInteraction, cbLayout, cbTitleBar, cbBehind, lblShadow, sldShadow, valShadowLeft, valShadowRight,
+        Controls.AddRange([lblAlpha, valAlpha, sldAlpha, cbInteraction, cbLayout, btnMove, cbTitleBar, cbBehind, lblShadow, sldShadow, valShadowLeft, valShadowRight,
             lblCorner, cbCorner, cmbCorner, cbStartup, lblTip, btnDonate, btnExit, btnAccount]);
 
         LayoutForDpi(DeviceDpi);  // provisional (system DPI); redone once the window's monitor is known
@@ -217,6 +220,8 @@ public class SettingsForm : Form
         y += sldAlpha.Height + S(8);
         y = Row(cbInteraction, x, y, w, 6);
         y = Row(cbLayout, x, y, w, 6);
+        btnMove.SetBounds(x, y, w, S(30));
+        y += S(36);
         y = Row(cbTitleBar, x, y, w, 6);
         y = Row(cbBehind, x, y, w, 20);
 
@@ -291,6 +296,7 @@ public class SettingsForm : Form
         {
             cbInteraction.Checked = interaction;
             cbLayout.Checked = layout;
+            btnMove.Enabled = interaction && layout;
             cbTitleBar.Checked = titleBar;
         }
         finally { syncingTrayOptions = false; }
