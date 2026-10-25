@@ -292,15 +292,18 @@ public class MainForm : Form
     {
         if (isClickThrough || !isLayoutUnlocked || !IsHandleCreated)
             return;
-        settingsForm?.Hide();
+        bool restoreSettings = settingsForm is { Visible: true };
+        if (restoreSettings)
+            settingsForm!.Hide();
         BeginInvoke(() =>
         {
-            if (IsDisposed || isClickThrough || !isLayoutUnlocked)
-                return;
-            Activate();
-            NativeMethods.SendMessage(Handle, NativeMethods.WM_SYSCOMMAND,
-                new IntPtr(NativeMethods.SC_MOVE), IntPtr.Zero);
-            if (settingsForm is { IsDisposed: false })
+            if (!IsDisposed && !isClickThrough && isLayoutUnlocked)
+            {
+                Activate();
+                NativeMethods.SendMessage(Handle, NativeMethods.WM_SYSCOMMAND,
+                    new IntPtr(NativeMethods.SC_MOVE), IntPtr.Zero);
+            }
+            if (restoreSettings && settingsForm is { IsDisposed: false })
                 settingsForm.ShowAndActivate();
         });
     }
