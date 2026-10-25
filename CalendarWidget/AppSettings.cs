@@ -22,6 +22,7 @@ public class AppSettings
     // Layout options are independent of the interactive/pass-through mode.
     public bool ShowTitleBar { get; set; } = true;
     public bool LayoutUnlocked { get; set; } = true;
+    public bool UseDateTrayIcon { get; set; } // app icon remains default
 
     // Optional interactive visibility while Windows Show Desktop is active.
     public bool KeepInteractiveVisibleOnDesktop { get; set; } = true;
