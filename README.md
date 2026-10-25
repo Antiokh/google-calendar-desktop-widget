@@ -31,7 +31,7 @@ And because it's the live Google Calendar — not a copy — **it updates in rea
 
 ## 🖱️ One button, two modes
 
-The mouse button in the top-right corner **stays clickable even in widget mode** — flipping back to a full, editable calendar is always exactly one click away.
+With **Show title bar** enabled, the mouse button in the top-right corner stays clickable even in widget mode, providing a quick way to enable calendar interaction. If you hide the title bar to reclaim space, use the tray menu or the optional corner hover panel to switch modes.
 
 <div align="center">
 <img src="assets/modes.svg" width="100%" alt="Clicking the title-bar mouse button toggles between interactive mode (a normal window) and widget mode (ghosted, click-through, pinned to the desktop)."/>
