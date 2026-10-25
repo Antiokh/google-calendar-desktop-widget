@@ -28,6 +28,7 @@ public class SettingsForm : Form
     private readonly Button btnMove;
     private readonly CheckBox cbTitleBar;
     private readonly CheckBox cbStayDesktop;
+    private readonly CheckBox cbDateIcon;
 
     private readonly Label lblAlpha = SectionLabel("TRANSPARENCY");
     private readonly Label valAlpha = ValueLabel(ContentAlignment.TopRight);
@@ -113,6 +114,12 @@ public class SettingsForm : Form
             if (!syncingTrayOptions) main.SetStayVisibleOnShowDesktop(cbStayDesktop.Checked);
         };
 
+        cbDateIcon = Check("Show date in tray icon", settings.UseDateTrayIcon);
+        cbDateIcon.CheckedChanged += (_, _) =>
+        {
+            if (!syncingTrayOptions) main.SetUseDateTrayIcon(cbDateIcon.Checked);
+        };
+
         // ---- live-wallpaper mode ----
         cbBehind = Check("Sit behind desktop icons (live wallpaper)", settings.BehindDesktopIcons);
         cbBehind.CheckedChanged += (_, _) =>
@@ -180,7 +187,7 @@ public class SettingsForm : Form
         btnAccount = ActionButton("Sign in", Fore);  // refreshed from the real cookie state whenever the form is shown
         btnAccount.Click += OnAccountClick;
 
-        Controls.AddRange([lblAlpha, valAlpha, sldAlpha, cbInteraction, cbLayout, btnMove, cbTitleBar, cbStayDesktop, cbBehind, lblShadow, sldShadow, valShadowLeft, valShadowRight,
+        Controls.AddRange([lblAlpha, valAlpha, sldAlpha, cbInteraction, cbLayout, btnMove, cbTitleBar, cbStayDesktop, cbDateIcon, cbBehind, lblShadow, sldShadow, valShadowLeft, valShadowRight,
             lblCorner, cbCorner, cmbCorner, cbStartup, lblTip, btnDonate, btnExit, btnAccount]);
 
         LayoutForDpi(DeviceDpi);  // provisional (system DPI); redone once the window's monitor is known
@@ -232,6 +239,7 @@ public class SettingsForm : Form
         y += S(36);
         y = Row(cbTitleBar, x, y, w, 6);
         y = Row(cbStayDesktop, x, y, w, 6);
+        y = Row(cbDateIcon, x, y, w, 6);
         y = Row(cbBehind, x, y, w, 20);
 
         y = Row(lblShadow, x, y, w, 4);
@@ -298,7 +306,7 @@ public class SettingsForm : Form
     }
 
     public void SyncTrayOptions(bool interaction, bool layout, bool titleBar,
-        bool behind, bool showDesktop)
+        bool behind, bool showDesktop, bool dateIcon)
     {
         if (IsDisposed) return;
         syncingTrayOptions = true;
@@ -309,6 +317,7 @@ public class SettingsForm : Form
             btnMove.Enabled = interaction && layout;
             cbTitleBar.Checked = titleBar;
             cbStayDesktop.Checked = showDesktop;
+            cbDateIcon.Checked = dateIcon;
         }
         finally { syncingTrayOptions = false; }
         SyncBehindDesktopIcons(behind);

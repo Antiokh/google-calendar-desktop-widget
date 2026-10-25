@@ -25,6 +25,9 @@ internal static class NativeMethods
     public const int WM_WINDOWPOSCHANGING = 0x0046;
     public const int WM_ENTERSIZEMOVE = 0x0231;
     public const int WM_EXITSIZEMOVE = 0x0232;
+    public const int WM_SETTINGCHANGE = 0x001A;
+    public const int WM_SYSCOLORCHANGE = 0x0015;
+    public const int WM_THEMECHANGED = 0x031A;
     public const int WM_SYSCOMMAND = 0x0112;
     public const int SC_MOVE = 0xF010;
     public const int SC_SIZE = 0xF000;

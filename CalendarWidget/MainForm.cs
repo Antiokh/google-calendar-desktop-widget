@@ -22,6 +22,11 @@ public class MainForm : Form
         DefaultBackgroundColor = Color.FromArgb(32, 33, 36),  // no white flash while pages load
     };
     private readonly NotifyIcon tray = new();
+    private readonly System.Windows.Forms.Timer trayDatePoll = new() { Interval = 30_000 };
+    private Icon? renderedTrayIcon;
+    private DateTime renderedTrayDate;
+    private bool renderedTrayInteraction;
+    private int renderedTrayColorArgb;
     private readonly System.Windows.Forms.Timer hoverPoll = new() { Interval = 100 };
     private readonly HoverPanel hoverPanel;
     private readonly TitleBar titleBar;
@@ -107,6 +112,8 @@ public class MainForm : Form
         ApplyThemeColors();
 
         SetupTray();
+        trayDatePoll.Tick += (_, _) => RefreshTrayIcon();
+        trayDatePoll.Start();
         hoverPoll.Tick += (_, _) => CheckMouseHover();
         hoverPoll.Start();
     }
@@ -399,7 +406,7 @@ public class MainForm : Form
     private void SyncSettingsControls() =>
         settingsForm?.SyncTrayOptions(!isClickThrough, isLayoutUnlocked,
             settings.ShowTitleBar, settings.BehindDesktopIcons,
-            settings.KeepInteractiveVisibleOnDesktop);
+            settings.KeepInteractiveVisibleOnDesktop, settings.UseDateTrayIcon);
 
     private void SetClickThrough(bool enable)
     {
@@ -457,6 +464,7 @@ public class MainForm : Form
         SyncSettingsControls();
         ApplyEdgeShadows();  // widget mode only: they'd hide content while interacting
         settings.Save();
+        RefreshTrayIcon();
         MaintainInteractiveDesktopVisibility();
     }
 
@@ -792,6 +800,11 @@ public class MainForm : Form
             BeginInvoke(ReconcileDisplayConfiguration);
 
         base.WndProc(ref m);
+        if (renderedTrayIcon is not null &&
+            (m.Msg == NativeMethods.WM_SETTINGCHANGE ||
+             m.Msg == NativeMethods.WM_THEMECHANGED ||
+             m.Msg == NativeMethods.WM_SYSCOLORCHANGE))
+            RefreshTrayIcon();
     }
 
     // WinForms recreates the handle for some property changes; re-apply manual styles if so
@@ -1770,6 +1783,9 @@ public class MainForm : Form
         menu.Items.Add(moveItem);
         menu.Items.Add(behindItem);
         menu.Items.Add(showDesktopItem);
+        var dateIconItem = new ToolStripMenuItem("Show date in tray icon", null,
+            (_, _) => SetUseDateTrayIcon(!settings.UseDateTrayIcon));
+        menu.Items.Add(dateIconItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Settings…", null, (_, _) => ShowSettings());
         menu.Items.Add(new ToolStripSeparator());
@@ -1782,9 +1798,10 @@ public class MainForm : Form
             moveItem.Enabled = !isClickThrough && isLayoutUnlocked;
             behindItem.Checked = settings.BehindDesktopIcons;
             showDesktopItem.Checked = settings.KeepInteractiveVisibleOnDesktop;
+            dateIconItem.Checked = settings.UseDateTrayIcon;
         };
-        tray.Icon = Icon ?? SystemIcons.Application;
         tray.Text = "Google Calendar Desktop Widget";
+        RefreshTrayIcon();
         tray.ContextMenuStrip = menu;
         tray.Visible = true;
         tray.DoubleClick += (_, _) => ToggleClickThrough();
@@ -1813,6 +1830,62 @@ public class MainForm : Form
         else
             MaintainInteractiveDesktopVisibility();
         SyncSettingsControls();
+    }
+
+    public void SetUseDateTrayIcon(bool enabled)
+    {
+        if (settings.UseDateTrayIcon == enabled)
+            return;
+        settings.UseDateTrayIcon = enabled;
+        settings.Save();
+        RefreshTrayIcon();
+        SyncSettingsControls();
+    }
+
+    /// <summary>
+    /// Render only a large date in the Windows taskbar's foreground color.
+    /// Use regular digits in click-through mode and bold digits in interactive
+    /// mode. Dispose the old icon after NotifyIcon replaces it.
+    /// </summary>
+    private void RefreshTrayIcon()
+    {
+        var today = DateTime.Today;
+        bool effectivelyInteractive = !isClickThrough;
+        string status = pendingInteractiveDetach
+            ? "Switching to interactive" : effectivelyInteractive ? "Interactive" : "Wallpaper";
+        tray.Text = $"Google Calendar - {today:dd MMM yyyy} - " + status;
+        if (!settings.UseDateTrayIcon)
+        {
+            tray.Icon = Icon ?? SystemIcons.Application;
+            renderedTrayIcon?.Dispose();
+            renderedTrayIcon = null;
+            return;
+        }
+        Color ink = TrayIconRenderer.GetTaskbarTextColor();
+        if (renderedTrayIcon is not null
+            && renderedTrayDate == today
+            && renderedTrayInteraction == effectivelyInteractive
+            && renderedTrayColorArgb == ink.ToArgb())
+            return;
+
+        Icon? replacement;
+        try
+        {
+            replacement = TrayIconRenderer.Create(today.Day, effectivelyInteractive, ink);
+        }
+        catch (Exception)
+        {
+            // Keep the tray accessible even if GDI drawing fails.
+            replacement = (Icon)(Icon ?? SystemIcons.Application).Clone();
+        }
+
+        var previous = renderedTrayIcon;
+        renderedTrayIcon = replacement;
+        tray.Icon = replacement;
+        renderedTrayDate = today;
+        renderedTrayInteraction = effectivelyInteractive;
+        renderedTrayColorArgb = ink.ToArgb();
+        previous?.Dispose();
     }
 
     public void ShowSettings()
@@ -1854,8 +1927,13 @@ public class MainForm : Form
             NativeMethods.UnhookWinEvent(restoreHook);
         ReleaseInteractiveDesktopPromotion();
         hoverPoll.Stop();
+        trayDatePoll.Stop();
+        trayDatePoll.Dispose();
         tray.Visible = false;
+        tray.Icon = null;
         tray.Dispose();
+        renderedTrayIcon?.Dispose();
+        renderedTrayIcon = null;
         base.OnFormClosed(e);
     }
 }
