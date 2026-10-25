@@ -89,25 +89,68 @@ public class MainForm : Form
         }
     }
 
-    public void ToggleMaximize() =>
+    public void ToggleMaximize()
+    {
+        if (WindowState == FormWindowState.Normal) SaveBounds();
         WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
+        SaveBounds();
+        settings.Save();
+    }
 
     protected override void OnLocationChanged(EventArgs e)
     {
         base.OnLocationChanged(e);
         titleBar?.Reposition();
+        // Win+Arrow / Aero Snap may change position without OnResizeEnd.
+        // Cache it now; persist to disk at exit or explicit layout actions.
+        if (IsHandleCreated)
+            SaveBounds();
     }
 
     protected override void OnSizeChanged(EventArgs e)
     {
         base.OnSizeChanged(e);
         titleBar?.Reposition();
+        // Capture keyboard/system maximize, restore and snap transitions.
+        if (IsHandleCreated)
+            SaveBounds();
+    }
+
+    protected override void OnResizeEnd(EventArgs e)
+    {
+        base.OnResizeEnd(e);
+        SaveBounds();
+        settings.Save();
+    }
+
+    // Validate accessibility on launch or monitor changes, not continuously.
+    private static Rectangle RecoverAccessibleBounds(Rectangle saved)
+    {
+        if (saved.Width <= 0 || saved.Height <= 0)
+            return Screen.PrimaryScreen!.WorkingArea;
+        long area = (long)saved.Width * saved.Height;
+        long visible = 0;
+        foreach (var screen in Screen.AllScreens)
+        {
+            var intersection = Rectangle.Intersect(saved, screen.WorkingArea);
+            visible += (long)intersection.Width * intersection.Height;
+        }
+        bool topReachable = Screen.AllScreens.Any(screen =>
+            screen.WorkingArea.IntersectsWith(
+                new Rectangle(saved.X, saved.Y, Math.Min(160, saved.Width), Math.Min(34, saved.Height))));
+        if (visible * 5 >= area * 4 && topReachable) return saved;
+        var work = Screen.FromRectangle(saved).WorkingArea;
+        int w = Math.Clamp(saved.Width, Math.Min(320, work.Width), work.Width);
+        int h = Math.Clamp(saved.Height, Math.Min(200, work.Height), work.Height);
+        return new Rectangle(Math.Clamp(saved.X, work.Left, work.Right - w),
+            Math.Clamp(saved.Y, work.Top, work.Bottom - h), w, h);
     }
 
     private Rectangle InitialBounds()
     {
-        if (settings.WinW > 0)
-            return new Rectangle(settings.WinX, settings.WinY, settings.WinW, settings.WinH);
+        if (settings.WinW > 0 && settings.WinH > 0)
+            return RecoverAccessibleBounds(new Rectangle(
+                settings.WinX, settings.WinY, settings.WinW, settings.WinH));
 
         // default: right side of the primary work area (no handle yet: DeviceDpi is the primary's)
         var wa = Screen.PrimaryScreen!.WorkingArea;
@@ -203,6 +246,9 @@ public class MainForm : Form
         titleBar.Show(this);  // owned controls can be available in either mode
         UpdateHeaderVisibility();
 
+        if (settings.WinMaximized)
+            WindowState = FormWindowState.Maximized;
+
         // first run: stay interactive so the user can sign in to Google;
         // afterwards the widget always starts in click-through mode
         SetClickThrough(!firstRun);
@@ -286,8 +332,7 @@ public class MainForm : Form
             titleBar.Hide();
     }
 
-    // When the title is hidden, the native system move command remains available
-    // from the tray/Settings; keyboard arrows move, Enter confirms, Escape cancels.
+    // With no title bar, the system move command is available via tray/Settings.
     public void BeginKeyboardMove()
     {
         if (isClickThrough || !isLayoutUnlocked || !IsHandleCreated)
@@ -435,8 +480,36 @@ public class MainForm : Form
 
         // a display-config change (resolution, monitor add/remove/power) recreates the
         // shell's WorkerW; re-attach promptly rather than waiting for the 1s watchdog
-        if (m.Msg == NativeMethods.WM_DISPLAYCHANGE && settings.BehindDesktopIcons && isClickThrough)
-            BeginInvoke(EnsureDesktopAttachment);
+        if (m.Msg == NativeMethods.WM_DISPLAYCHANGE)
+        {
+            BeginInvoke(() =>
+            {
+                if (!IsHandleCreated || IsDisposed) return;
+                if (attachedToDesktop)
+                {
+                    if (settings.BehindDesktopIcons && isClickThrough)
+                        EnsureDesktopAttachment();
+                    return;
+                }
+                if (WindowState == FormWindowState.Minimized) return;
+                var normal = WindowState == FormWindowState.Maximized ? RestoreBounds : Bounds;
+                var recovered = RecoverAccessibleBounds(normal);
+                if (normal != recovered)
+                {
+                    if (WindowState == FormWindowState.Maximized)
+                    {
+                        WindowState = FormWindowState.Normal;
+                        Bounds = recovered;
+                        WindowState = FormWindowState.Maximized;
+                    }
+                    else Bounds = recovered;
+                    SaveBounds();
+                    settings.Save();
+                }
+                if (settings.BehindDesktopIcons && isClickThrough)
+                    EnsureDesktopAttachment();
+            });
+        }
 
         base.WndProc(ref m);
     }
@@ -974,22 +1047,30 @@ public class MainForm : Form
 
     private void SaveBounds()
     {
-        if (WindowState != FormWindowState.Normal)
-            return;
-        settings.WinX = Bounds.X;
-        settings.WinY = Bounds.Y;
-        settings.WinW = Bounds.Width;
-        settings.WinH = Bounds.Height;
+        if (attachedToDesktop || WindowState == FormWindowState.Minimized) return;
+        var normal = WindowState == FormWindowState.Maximized ? RestoreBounds : Bounds;
+        if (normal.Width < 100 || normal.Height < 100) return;
+        settings.WinX = normal.X;
+        settings.WinY = normal.Y;
+        settings.WinW = normal.Width;
+        settings.WinH = normal.Height;
+        settings.WinMaximized = WindowState == FormWindowState.Maximized;
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        // Called while the HWND and RestoreBounds still exist. The SaveBounds
+        // guard protects wallpaper child coordinates and minimized state.
+        // Unlike the former passive-only close path, this includes an
+        // interactive window maximized/snapped with Win+Arrow.
+        SaveBounds();
+        settings.Save();
+        base.OnFormClosing(e);
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         hoverPoll.Stop();
-        // while attached, Bounds are WorkerW-relative and the window can't have moved
-        // since attach anyway — the entering-widget-mode SaveBounds already captured them
-        if (isClickThrough && !attachedToDesktop)
-            SaveBounds();
-        settings.Save();
         tray.Visible = false;
         tray.Dispose();
         base.OnFormClosed(e);

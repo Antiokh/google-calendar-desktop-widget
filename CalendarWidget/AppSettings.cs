@@ -47,6 +47,7 @@ public class AppSettings
     public int WinY { get; set; }
     public int WinW { get; set; }
     public int WinH { get; set; }
+    public bool WinMaximized { get; set; }
 
     public static string DataFolder { get; } =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CalendarWidget");
