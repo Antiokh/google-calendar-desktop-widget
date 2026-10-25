@@ -8,12 +8,18 @@ namespace CalendarWidget;
 
 internal static class NativeMethods
 {
+    public const int GWL_STYLE = -16;
     public const int GWL_EXSTYLE = -20;
+    public const long WS_CHILD = 0x40000000L;
+    public const long WS_POPUP = 0x80000000L;
+    public const uint SWP_FRAMECHANGED = 0x0020;
 
     public const long WS_EX_TRANSPARENT = 0x00000020;  // mouse passes through
     public const long WS_EX_NOACTIVATE = 0x08000000;   // never steals keyboard focus
 
     public const int WM_WINDOWPOSCHANGING = 0x0046;
+    public const int WM_ENTERSIZEMOVE = 0x0231;
+    public const int WM_EXITSIZEMOVE = 0x0232;
     public const int WM_SYSCOMMAND = 0x0112;
     public const int SC_MOVE = 0xF010;
     public const int SC_SIZE = 0xF000;
@@ -40,10 +46,10 @@ internal static class NativeMethods
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
 
-    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
     public static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError = true)]
     public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
         int x, int y, int cx, int cy, uint uFlags);
 
@@ -103,8 +109,127 @@ internal static class NativeMethods
 
     // ---- live-wallpaper mode: reparent the widget behind the desktop icons ----
 
+    private const uint GA_PARENT = 1;
+
     [DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetDesktopWindow();
+
+    [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+
+    /// <summary>
+    /// SetParent and WS_CHILD/WS_POPUP are independent Win32 operations.
+    /// Return whether the native parent reached its requested target, NOT a
+    /// combined parent/style result. The caller must never mistake an attached
+    /// WorkerW child for a still-top-level HWND if a style update fails.
+    /// </summary>
+    public static bool TrySetParent(IntPtr child, IntPtr parent, out int error)
+    {
+        error = 0;
+        if (child == IntPtr.Zero || !IsWindow(child))
+        {
+            error = 1400; // ERROR_INVALID_WINDOW_HANDLE
+            return false;
+        }
+
+        bool attaching = parent != IntPtr.Zero;
+        IntPtr originalParent = GetAncestor(child, GA_PARENT);
+        if (attaching && !TryRepairParentStyle(child, attached: true, out error))
+        {
+            // A frame refresh can fail AFTER SetWindowLongPtr has already
+            // applied WS_CHILD. Roll back before returning unsuccessful so
+            // callers never receive an apparently top-level child-style HWND.
+            int originalError = error;
+            if (!TryRepairParentStyle(child, attached: false, out int rollbackError))
+                System.Diagnostics.Debug.WriteLine(
+                    $"WorkerW pre-attach style rollback failed: {rollbackError}");
+            error = originalError;
+            return false;
+        }
+
+        Marshal.SetLastPInvokeError(0);
+        _ = SetParent(child, parent);
+        int parentError = Marshal.GetLastPInvokeError();
+        IntPtr actualParent = GetAncestor(child, GA_PARENT);
+        bool parentMatches = actualParent == (attaching ? parent : GetDesktopWindow());
+
+        if (!parentMatches)
+        {
+            error = parentError == 0 ? 87 : parentError;
+            // SetParent did not move the window: restore the original top-level
+            // style. A stray third-party parent is NOT treated as success.
+            if (attaching && actualParent == originalParent)
+                TryRepairParentStyle(child, attached: false, out _);
+            return false;
+        }
+
+        // A successful SetParent must be reported as success even if a
+        // subsequent style/frame update fails; otherwise the caller would
+        // clear its snapshot and manipulate a WorkerW child as a top-level form.
+        if (!TryRepairParentStyle(child, attaching, out int styleError))
+        {
+            error = styleError;
+            System.Diagnostics.Debug.WriteLine(
+                $"SetParent reached target, but WS_CHILD/WS_POPUP repair failed: {styleError}");
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Idempotent style reconciliation; may be retried by the guarded WorkerW
+    /// watchdog after a transient failure. When a previous SWP_FRAMECHANGED
+    /// failed after applying style bits, forceFrameRefresh retries it even if
+    /// the style already matches. Check style readback before reporting success.
+    /// </summary>
+    public static bool TryRepairParentStyle(IntPtr child, bool attached, out int error,
+        bool forceFrameRefresh = false)
+    {
+        error = 0;
+        if (child == IntPtr.Zero || !IsWindow(child))
+        {
+            error = 1400;
+            return false;
+        }
+        long current = GetWindowLongPtr(child, GWL_STYLE).ToInt64();
+        long desired = attached
+            ? (current | WS_CHILD) & ~WS_POPUP
+            : (current & ~WS_CHILD) | WS_POPUP;
+        int styleError = 0;
+        if (current != desired)
+        {
+            Marshal.SetLastPInvokeError(0);
+            _ = SetWindowLongPtr(child, GWL_STYLE, new IntPtr(desired));
+            styleError = Marshal.GetLastPInvokeError();
+        }
+        else if (!forceFrameRefresh)
+            return true;
+        long actual = GetWindowLongPtr(child, GWL_STYLE).ToInt64();
+        bool styleMatches = attached
+            ? (actual & WS_CHILD) != 0 && (actual & WS_POPUP) == 0
+            : (actual & WS_CHILD) == 0 && (actual & WS_POPUP) != 0;
+        if (!styleMatches)
+        {
+            error = styleError == 0 ? 87 : styleError;
+            return false;
+        }
+        if (!SetWindowPos(child, IntPtr.Zero, 0, 0, 0, 0,
+                SWP_NOSIZE_NOMOVE_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED))
+        {
+            error = Marshal.GetLastPInvokeError();
+            return false;
+        }
+        return true;
+    }
+
+    public static bool HasParent(IntPtr child, IntPtr parent) =>
+        GetAncestor(child, GA_PARENT) == parent;
+
+    public static bool HasDesktopParent(IntPtr child) =>
+        child != IntPtr.Zero && IsWindow(child) &&
+        GetAncestor(child, GA_PARENT) == GetDesktopWindow();
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetParent(IntPtr hWnd);
@@ -210,11 +335,33 @@ internal static class NativeMethods
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+
+    /// <summary>
+    /// Real outer HWND coordinates in screen space. Both this P/Invoke and the
+    /// WinForms Screen coordinates run in the widget's per-monitor DPI context.
+    /// </summary>
+    public static bool TryGetWindowRect(IntPtr hwnd, out Rectangle bounds)
+    {
+        if (GetWindowRect(hwnd, out var rect))
+        {
+            bounds = Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom);
+            return true;
+        }
+        bounds = Rectangle.Empty;
+        return false;
+    }
+
     [DllImport("user32.dll")]
     public static extern uint GetDpiForWindow(IntPtr hwnd);
 
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(Point point, uint flags);
 
     [DllImport("shcore.dll")]
     private static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
@@ -228,6 +375,14 @@ internal static class NativeMethods
     {
         IntPtr monitor = MonitorFromWindow(hwnd, 2 /*MONITOR_DEFAULTTONEAREST*/);
         return GetDpiForMonitor(monitor, 0 /*MDT_EFFECTIVE_DPI*/, out uint dpi, out _) == 0 ? (int)dpi : 96;
+    }
+
+    /// <summary>Effective DPI of the screen that contains a screen-space rectangle.</summary>
+    public static int MonitorDpiAt(Rectangle bounds)
+    {
+        var center = new Point(bounds.Left + bounds.Width / 2, bounds.Top + bounds.Height / 2);
+        IntPtr monitor = MonitorFromPoint(center, 2 /*MONITOR_DEFAULTTONEAREST*/);
+        return GetDpiForMonitor(monitor, 0, out uint dpi, out _) == 0 ? (int)dpi : 96;
     }
 
     /// <summary>

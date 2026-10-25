@@ -35,7 +35,21 @@ public class MainForm : Form
     private DateTime? hoverHideDeadline;  // set while the panel is visible but the mouse has left it
     private int guardTick;                // periodic re-assert of click-through styles
     private int styleBurst;               // fast re-assert right after enabling (Chrome recreates windows)
-    private int attachCheckTick;          // throttle for the behind-icons re-attach watchdog
+    private int attachCheckTick;
+    private bool nativeMoveSizeActive;
+    private bool desktopDiscoveryInFlight;
+    private int desktopDiscoveryFailures;
+    private long nextDesktopDiscoveryAt;
+    private bool pendingInteractiveDetach;
+    private bool pendingWallpaperDetach;
+    // SetParent can succeed although a later style/frame refresh fails.
+    // Retry style repair independently from wallpaper mode and interaction.
+    private bool pendingTopLevelStyleRepair;
+    private bool pendingAttachedStyleRepair;
+    private long nextTopLevelStyleRepairAt;
+    private bool desktopStateSnapshotValid;
+    private bool reparentInProgress;
+    private int reparentGeneration;          // throttle for the behind-icons re-attach watchdog
     private bool attachedToDesktop;       // reparented into WorkerW (behind the desktop icons)
     private IntPtr attachedWorkerW;       // the specific WorkerW we parented into; its destruction = orphaned
     private Rectangle boundsBeforeAttach; // screen bounds to restore on detach (child coords are parent-relative)
@@ -359,6 +373,13 @@ public class MainForm : Form
 
     private void SetClickThrough(bool enable)
     {
+        if (enable)
+        {
+            pendingInteractiveDetach = false;
+            if (!settings.BehindDesktopIcons && attachedToDesktop)
+                pendingWallpaperDetach = true;
+            ResetDesktopDiscoveryBackoff();
+        }
         isClickThrough = enable;
         previewLook = false;  // widget mode shows the real look; interactive starts opaque again
         if (enable)
@@ -377,7 +398,18 @@ public class MainForm : Form
         }
         else
         {
-            DetachFromDesktop();  // interactive mode is always a normal top-level window
+            if (!DetachFromDesktop())
+            {
+                isClickThrough = true;
+                pendingInteractiveDetach = true;
+                RecordDesktopDiscoveryFailure();
+                hoverPanel.UpdateState(true);
+                titleBar.UpdateState(true, Opacity);
+                return;
+            }
+            pendingInteractiveDetach = false;
+            pendingWallpaperDetach = false;
+            ResetDesktopDiscoveryBackoff();
             styleBurst = 0;
             NativeMethods.DisableClickThrough(clickThroughApplied);
             NativeMethods.RemoveExStyle(Handle, NativeMethods.WS_EX_NOACTIVATE);
@@ -399,6 +431,11 @@ public class MainForm : Form
     // (taskbar click, alt-tab, shell repositioning) is rewritten to HWND_BOTTOM
     protected override void WndProc(ref Message m)
     {
+        if (m.Msg == NativeMethods.WM_ENTERSIZEMOVE)
+            nativeMoveSizeActive = true;
+        else if (m.Msg == NativeMethods.WM_EXITSIZEMOVE)
+            nativeMoveSizeActive = false;
+
         if (m.Msg == NativeMethods.WM_WINDOWPOSCHANGING && isClickThrough && m.LParam != IntPtr.Zero)
         {
             var wp = Marshal.PtrToStructure<NativeMethods.WINDOWPOS>(m.LParam);
@@ -481,35 +518,7 @@ public class MainForm : Form
         // a display-config change (resolution, monitor add/remove/power) recreates the
         // shell's WorkerW; re-attach promptly rather than waiting for the 1s watchdog
         if (m.Msg == NativeMethods.WM_DISPLAYCHANGE)
-        {
-            BeginInvoke(() =>
-            {
-                if (!IsHandleCreated || IsDisposed) return;
-                if (attachedToDesktop)
-                {
-                    if (settings.BehindDesktopIcons && isClickThrough)
-                        EnsureDesktopAttachment();
-                    return;
-                }
-                if (WindowState == FormWindowState.Minimized) return;
-                var normal = WindowState == FormWindowState.Maximized ? RestoreBounds : Bounds;
-                var recovered = RecoverAccessibleBounds(normal);
-                if (normal != recovered)
-                {
-                    if (WindowState == FormWindowState.Maximized)
-                    {
-                        WindowState = FormWindowState.Normal;
-                        Bounds = recovered;
-                        WindowState = FormWindowState.Maximized;
-                    }
-                    else Bounds = recovered;
-                    SaveBounds();
-                    settings.Save();
-                }
-                if (settings.BehindDesktopIcons && isClickThrough)
-                    EnsureDesktopAttachment();
-            });
-        }
+            BeginInvoke(ReconcileDisplayConfiguration);
 
         base.WndProc(ref m);
     }
@@ -518,6 +527,7 @@ public class MainForm : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+        nativeMoveSizeActive = false;
         NativeMethods.ApplyRoundedCorners(Handle);  // borderless windows get square corners by default
         if (isClickThrough)
         {
@@ -707,95 +717,349 @@ public class MainForm : Form
 
     // ---------------- live-wallpaper mode (behind desktop icons) ----------------
 
-    /// <summary>Reparent into the shell's WorkerW layer so the widget renders UNDER the desktop icons.</summary>
-    private void AttachToDesktop()
-    {
-        if (attachedToDesktop)
-            return;
-        IntPtr workerW = NativeMethods.FindDesktopWorkerW();
-        if (workerW == IntPtr.Zero)
-            return;  // shell didn't cooperate; stay a normal bottom-pinned window
+    private static bool NeedsOffscreenRecovery(Rectangle rect) =>
+        RecoverAccessibleBounds(rect) != rect;
 
+    private void FinishReparentTransition(int generation)
+    {
+        if (generation != reparentGeneration)
+            return;
+        reparentInProgress = false;
+        NativeMethods.SetRedraw(Handle, true);
+        NativeMethods.RepaintAll(Handle);
+    }
+
+    private void CancelReparentTransition()
+    {
+        ++reparentGeneration;  // invalidates any queued callback
+        reparentInProgress = false;
+        NativeMethods.SetRedraw(Handle, true);
+        NativeMethods.RepaintAll(Handle);
+    }
+
+    /// <summary>
+    /// WorkerW inherits Explorer's DPI context, which may differ from the
+    /// physical monitor displaying this child after a hot-plug. Apply the
+    /// effective screen-to-parent DPI ratio only when it actually changed.
+    /// </summary>
+    private void UpdateWallpaperZoom()
+    {
+        if (!attachedToDesktop || !IsHandleCreated)
+            return;
+        double target = NativeMethods.MonitorDpiAt(boundsBeforeAttach)
+                        / (double)Math.Max(1, NativeMethods.GetDpiForWindow(Handle));
+        try
+        {
+            if (Math.Abs(webView.ZoomFactor - target) > 0.005)
+                webView.ZoomFactor = target;
+        }
+        catch (InvalidOperationException)
+        {
+            // WebView2 controller has not been initialized or was disposed.
+        }
+    }
+
+    private void ResetWallpaperZoom()
+    {
+        try
+        {
+            if (Math.Abs(webView.ZoomFactor - 1.0) > 0.005)
+                webView.ZoomFactor = 1.0;
+        }
+        catch (InvalidOperationException) { }
+    }
+
+    /// <summary>
+    /// Discovery may take more than two seconds if Explorer is unavailable.
+    /// Do all synchronous EnumWindows/SendMessageTimeout/sleeps off the UI
+    /// thread, with one in-flight request and bounded exponential retry delay.
+    /// All WinForms calls after the await resume on the UI message loop.
+    /// </summary>
+    private async void AttachToDesktop()
+    {
+        if (attachedToDesktop || !isClickThrough || !settings.BehindDesktopIcons ||
+            desktopDiscoveryInFlight || Environment.TickCount64 < nextDesktopDiscoveryAt ||
+            IsDisposed || Disposing || !IsHandleCreated)
+            return;
+
+        desktopDiscoveryInFlight = true;
+        try
+        {
+            IntPtr workerW = await Task.Run(NativeMethods.FindDesktopWorkerW);
+            if (IsDisposed || Disposing || !IsHandleCreated ||
+                attachedToDesktop || !isClickThrough || !settings.BehindDesktopIcons)
+                return;
+
+            if (!NativeMethods.IsWorkerW(workerW))
+            {
+                // Explorer unavailable or recycled the candidate before the
+                // discovery completed. Leave the tray responsive and retry later.
+                RecordDesktopDiscoveryFailure();
+                return;
+            }
+
+            // Successful discovery is not sufficient: SetParent can still fail.
+            // Do not reset retry throttling until native attachment succeeded.
+            if (AttachToWorkerW(workerW))
+                ResetDesktopDiscoveryBackoff();
+            else
+                RecordDesktopDiscoveryFailure();
+        }
+        catch (Exception ex)
+        {
+            // Native Explorer interactions can fail when the shell restarts;
+            // keep an async-void continuation from crashing the UI thread.
+            System.Diagnostics.Debug.WriteLine($"WorkerW discovery failed: {ex}");
+            // If reparenting itself failed after suspending painting, do not
+            // leave the browser's native window frozen until another retry.
+            if (reparentInProgress)
+                CancelReparentTransition();
+            RecordDesktopDiscoveryFailure();
+        }
+        finally
+        {
+            desktopDiscoveryInFlight = false;
+        }
+    }
+
+    private void ResetDesktopDiscoveryBackoff()
+    {
+        desktopDiscoveryFailures = 0;
+        nextDesktopDiscoveryAt = 0;
+    }
+
+    private void RecordDesktopDiscoveryFailure()
+    {
+        desktopDiscoveryFailures = Math.Min(desktopDiscoveryFailures + 1, 5);
+        nextDesktopDiscoveryAt = Environment.TickCount64 +
+            Math.Min(30000, 2000L << (desktopDiscoveryFailures - 1));
+    }
+
+    /// <summary>
+    /// UI-thread-only attachment after WorkerW discovery on a background thread.
+    /// </summary>
+    private bool AttachToWorkerW(IntPtr workerW)
+    {
+        if (attachedToDesktop || !isClickThrough || !settings.BehindDesktopIcons ||
+            !NativeMethods.IsWorkerW(workerW))
+            return false;
+
+        int generation = ++reparentGeneration;
+        reparentInProgress = true;
         NativeMethods.SetRedraw(Handle, false);  // freeze painting so the DPI rescale doesn't flash
 
         // a child window must not be "maximized": drop to Normal sized to the work area
         // (no invisible-frame overhang, no WM_NCCALCSIZE maximize inset) and re-maximize
         // on detach. RestoreBounds keeps the pre-maximize rect for later.
-        maximizedBeforeAttach = WindowState == FormWindowState.Maximized;
-        if (maximizedBeforeAttach)
+        if (!desktopStateSnapshotValid)
         {
-            normalBoundsBeforeAttach = RestoreBounds;
+            // Snapshot only once per wallpaper session; Win11 may destroy and
+            // recreate WorkerW several times without a mode change.
+            maximizedBeforeAttach = WindowState == FormWindowState.Maximized;
+            if (maximizedBeforeAttach)
+                normalBoundsBeforeAttach = RestoreBounds;
+            desktopStateSnapshotValid = true;
+        }
+        if (maximizedBeforeAttach && WindowState == FormWindowState.Maximized)
+        {
             var wa = Screen.FromControl(this).WorkingArea;
             WindowState = FormWindowState.Normal;
             Bounds = wa;
         }
+        // A previous WorkerW may have been destroyed while the display layout
+        // changed. Fit the old screen-space rectangle before reparenting.
+        Bounds = maximizedBeforeAttach
+            ? Screen.FromRectangle(Bounds).WorkingArea
+            : RecoverAccessibleBounds(Bounds);
         boundsBeforeAttach = Bounds;
 
-        uint dpiBefore = NativeMethods.GetDpiForWindow(Handle);
         var pt = boundsBeforeAttach.Location;
-        NativeMethods.SetParent(Handle, workerW);
-        NativeMethods.ScreenToClient(workerW, ref pt);  // child coordinates are WorkerW-relative
-        NativeMethods.SetWindowPos(Handle, IntPtr.Zero, pt.X, pt.Y,
-            boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE);
-        attachedToDesktop = true;
+        if (!NativeMethods.TrySetParent(Handle, workerW, out int nativeError))
+        {
+            System.Diagnostics.Debug.WriteLine($"WorkerW attach failed, GetLastError={nativeError}");
+            if (maximizedBeforeAttach)
+            {
+                Bounds = RecoverAccessibleBounds(normalBoundsBeforeAttach);
+                WindowState = FormWindowState.Maximized;
+            }
+            desktopStateSnapshotValid = false;
+            maximizedBeforeAttach = false;
+            FinishReparentTransition(generation);
+            return false;
+        }
+        attachedToDesktop = true;  // native parent already verified
         attachedWorkerW = workerW;
-        EnsureStripBackdrop();  // the painted strip is invisible from here on
+        pendingTopLevelStyleRepair = false;
+        pendingAttachedStyleRepair = nativeError != 0;
+        // A failed coordinate conversion must not bypass title-strip setup.
+        // OnLoad handles a not-yet-initialized WebView2 environment as usual.
+        EnsureStripBackdrop();
+        if (!NativeMethods.ScreenToClient(workerW, ref pt))
+        {
+            // Explorer may destroy/reparent WorkerW between SetParent and the
+            // coordinate conversion. Never pass absolute screen coordinates
+            // to a child-relative SetWindowPos; the watchdog will recover.
+            System.Diagnostics.Debug.WriteLine("WorkerW attach: ScreenToClient failed; watchdog will reconcile");
+            FinishReparentTransition(generation);
+            return true;
+        }
+        if (!NativeMethods.SetWindowPos(Handle, IntPtr.Zero, pt.X, pt.Y,
+                boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE))
+            System.Diagnostics.Debug.WriteLine("WorkerW attach: initial SetWindowPos failed; watchdog will retry");
 
         // reparenting swaps the DPI context to the primary monitor's: WebView2 re-zooms
         // and WinForms may rescale layout. After the DPI messages drain, compensate the
         // browser zoom and re-assert physical geometry so nothing shifts or resizes, then
         // resume painting in one clean repaint (no visible zoom-in/zoom-out).
-        BeginInvoke(() =>
+        try
         {
-            if (!attachedToDesktop)
+            BeginInvoke(() =>
             {
-                NativeMethods.SetRedraw(Handle, true);
-                return;
-            }
-            uint dpiAfter = Math.Max(1, NativeMethods.GetDpiForWindow(Handle));
-            try { webView.ZoomFactor = dpiBefore / (double)dpiAfter; } catch { }
-            var p2 = boundsBeforeAttach.Location;
-            NativeMethods.ScreenToClient(workerW, ref p2);
-            NativeMethods.SetWindowPos(Handle, IntPtr.Zero, p2.X, p2.Y,
-                boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE);
-            ApplyPadding();
-            titleBar.Reposition();
-            NativeMethods.SetRedraw(Handle, true);
-            NativeMethods.RepaintAll(Handle);
-        });
+                if (generation != reparentGeneration)
+                    return;
+                try
+                {
+                    if (!attachedToDesktop)
+                        return;
+                    UpdateWallpaperZoom();
+                    var p2 = boundsBeforeAttach.Location;
+                    if (!NativeMethods.IsWorkerW(workerW) ||
+                        !NativeMethods.HasParent(Handle, workerW) ||
+                        !NativeMethods.ScreenToClient(workerW, ref p2))
+                    {
+                        System.Diagnostics.Debug.WriteLine("WorkerW attach: delayed ScreenToClient failed; watchdog will reconcile");
+                        return;
+                    }
+                    if (!NativeMethods.SetWindowPos(Handle, IntPtr.Zero, p2.X, p2.Y,
+                            boundsBeforeAttach.Width, boundsBeforeAttach.Height, NativeMethods.SWP_NOZORDER_NOACTIVATE))
+                        System.Diagnostics.Debug.WriteLine("WorkerW attach: delayed SetWindowPos failed; watchdog will retry");
+                    ApplyPadding();
+                    titleBar.Reposition();
+                }
+                finally
+                {
+                    FinishReparentTransition(generation);
+                }
+            });
+        }
+        catch (InvalidOperationException)
+        {
+            FinishReparentTransition(generation);
+        }
+        return true;
     }
 
-    private void DetachFromDesktop()
+    private bool DetachFromDesktop()
     {
         if (!attachedToDesktop)
-            return;
+        {
+            // Orphan recovery returned the window to top-level; the old
+            // wallpaper DPI compensation must not survive interactive mode.
+            ResetWallpaperZoom();
+            if (desktopStateSnapshotValid)
+            {
+                if (maximizedBeforeAttach)
+                {
+                    normalBoundsBeforeAttach = RecoverAccessibleBounds(normalBoundsBeforeAttach);
+                    Bounds = normalBoundsBeforeAttach;
+                    WindowState = FormWindowState.Maximized;
+                }
+                desktopStateSnapshotValid = false;
+                maximizedBeforeAttach = false;
+            }
+            return true;
+        }
+        int generation = ++reparentGeneration;
+        reparentInProgress = true;
         NativeMethods.SetRedraw(Handle, false);
-        NativeMethods.SetParent(Handle, IntPtr.Zero);
+        if (!NativeMethods.TrySetParent(Handle, IntPtr.Zero, out int nativeError))
+        {
+            System.Diagnostics.Debug.WriteLine($"WorkerW detach failed, GetLastError={nativeError}");
+            FinishReparentTransition(generation);
+            return false;
+        }
         attachedToDesktop = false;
         attachedWorkerW = IntPtr.Zero;
-        try { webView.ZoomFactor = 1.0; } catch { }
+        QueueTopLevelStyleRepair(nativeError);
+        ResetWallpaperZoom();
         Bounds = boundsBeforeAttach;
         if (maximizedBeforeAttach)
         {
+            normalBoundsBeforeAttach = RecoverAccessibleBounds(normalBoundsBeforeAttach);
             Bounds = normalBoundsBeforeAttach;  // seed RestoreBounds with the original rect
             WindowState = FormWindowState.Maximized;
-            maximizedBeforeAttach = false;
         }
+        desktopStateSnapshotValid = false;
+        maximizedBeforeAttach = false;
         // same DPI-context swap in reverse; re-assert geometry after messages drain
-        BeginInvoke(() =>
+        try
         {
-            if (attachedToDesktop)
+            BeginInvoke(() =>
             {
-                NativeMethods.SetRedraw(Handle, true);
+                if (generation != reparentGeneration)
+                    return;
+                try
+                {
+                    if (attachedToDesktop)
+                        return;
+                    if (WindowState == FormWindowState.Normal && Bounds != boundsBeforeAttach)
+                        Bounds = boundsBeforeAttach;
+                    ApplyPadding();
+                    titleBar.Reposition();
+                }
+                finally
+                {
+                    FinishReparentTransition(generation);
+                }
+            });
+        }
+        catch (InvalidOperationException)
+        {
+            FinishReparentTransition(generation);
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Correct actual HWND drift (including WinForms/DPI side effects) even
+    /// when the cached desired rectangle has not changed. GetWindowRect is
+    /// screen-relative; SetWindowPos on a WorkerW child is parent-relative.
+    /// </summary>
+    private void ReconcileAttachedGeometry()
+    {
+        if (reparentInProgress || !attachedToDesktop || !NativeMethods.IsWindow(attachedWorkerW))
+            return;
+
+        var target = maximizedBeforeAttach
+            ? Screen.FromRectangle(boundsBeforeAttach).WorkingArea
+            : RecoverAccessibleBounds(boundsBeforeAttach);
+        if (!NativeMethods.TryGetWindowRect(Handle, out var actual))
+            return;
+
+        // A small tolerance absorbs harmless pixel rounding in DPI transitions.
+        static bool Near(int x, int y) => Math.Abs((long)x - y) <= 2;
+        bool correct = Near(actual.Left, target.Left) && Near(actual.Top, target.Top)
+                    && Near(actual.Width, target.Width) && Near(actual.Height, target.Height);
+
+        if (!correct)
+        {
+            var childLocation = target.Location;
+            if (!NativeMethods.ScreenToClient(attachedWorkerW, ref childLocation))
+                return;
+            if (!NativeMethods.SetWindowPos(Handle, IntPtr.Zero,
+                    childLocation.X, childLocation.Y, target.Width, target.Height,
+                    NativeMethods.SWP_NOZORDER_NOACTIVATE))
+            {
+                // Do not overwrite our desired bounds; next watchdog can
+                // retry even if no monitor work-area change has happened.
+                System.Diagnostics.Debug.WriteLine("WorkerW geometry reconciliation: SetWindowPos failed");
                 return;
             }
-            if (WindowState == FormWindowState.Normal)
-                Bounds = boundsBeforeAttach;
-            ApplyPadding();
             titleBar.Reposition();
-            NativeMethods.SetRedraw(Handle, true);
-            NativeMethods.RepaintAll(Handle);
-        });
+        }
+
+        boundsBeforeAttach = target;
+        UpdateWallpaperZoom();
     }
 
     /// <summary>
@@ -804,44 +1068,204 @@ public class MainForm : Form
     /// but floats at stale WorkerW-relative coordinates, so it appears to vanish. Detect the
     /// orphaning and re-attach to the fresh WorkerW. Runs from the 100 ms poll, throttled.
     ///
-    /// The orphaning signal is the DESTRUCTION of the WorkerW we attached to
-    /// (`IsWindow(attachedWorkerW)`), NOT `GetParent(Handle)`: a WinForms window keeps its
-    /// top-level style after SetParent, so GetParent returns 0 even while correctly parented
-    /// — checking it would re-attach every tick and flicker the WebView white.
+    /// Validate the real native parent with GetAncestor(GA_PARENT) in addition
+    /// to WorkerW liveness, since a previous SetParent may have partly failed
+    /// or Explorer may have replaced the shell window.
     /// </summary>
     private void EnsureDesktopAttachment()
     {
         if (!settings.BehindDesktopIcons || !isClickThrough)
             return;
-        if (attachedToDesktop && NativeMethods.IsWindow(attachedWorkerW))
-            return;  // the WorkerW we're parented into is still alive — nothing to do
+        if (attachedToDesktop && NativeMethods.IsWorkerW(attachedWorkerW) &&
+            NativeMethods.HasParent(Handle, attachedWorkerW))
+        {
+            // Child-relative coordinates may have failed to apply immediately
+            // after SetParent. The guarded 1s watchdog retries only actual
+            // geometry drift; unrelated top-level geometry remains event-driven.
+            if (!reparentInProgress)
+            {
+                bool fixedStyle = NativeMethods.TryRepairParentStyle(Handle, attached: true,
+                    out int styleError, forceFrameRefresh: pendingAttachedStyleRepair);
+                pendingAttachedStyleRepair = !fixedStyle;
+                if (!fixedStyle)
+                    System.Diagnostics.Debug.WriteLine($"WorkerW child style retry failed: {styleError}");
+                ReconcileAttachedGeometry();
+            }
+            return;
+        }
+
+        // Honor the same retry gate for a failed orphan detach as for failed
+        // discovery/attachment. Otherwise the 1s watchdog bypasses backoff.
+        if (Environment.TickCount64 < nextDesktopDiscoveryAt)
+            return;
 
         if (attachedToDesktop)
         {
-            // our WorkerW was destroyed: return to a valid top-level state at known-good bounds
-            NativeMethods.SetParent(Handle, IntPtr.Zero);
-            attachedToDesktop = false;
-            attachedWorkerW = IntPtr.Zero;
-            Bounds = boundsBeforeAttach;
+            // The parent may disappear before the frozen attach callback ran.
+            // Always thaw even if no replacement WorkerW can be discovered.
+            try
+            {
+                if (!NativeMethods.TrySetParent(Handle, IntPtr.Zero, out int nativeError))
+                {
+                    System.Diagnostics.Debug.WriteLine($"WorkerW orphan recovery failed, GetLastError={nativeError}");
+                    RecordDesktopDiscoveryFailure();
+                    return;  // retain native attachment state until a successful detach
+                }
+                attachedToDesktop = false;
+                attachedWorkerW = IntPtr.Zero;
+                QueueTopLevelStyleRepair(nativeError);
+                ResetWallpaperZoom();
+                boundsBeforeAttach = maximizedBeforeAttach
+                    ? Screen.FromRectangle(boundsBeforeAttach).WorkingArea
+                    : RecoverAccessibleBounds(boundsBeforeAttach);
+                Bounds = boundsBeforeAttach;
+            }
+            finally
+            {
+                CancelReparentTransition();
+            }
+        }
+        else if (desktopStateSnapshotValid)
+        {
+            // Recovery already left us top-level; handle further display
+            // changes during Explorer downtime before retrying attachment.
+            boundsBeforeAttach = maximizedBeforeAttach
+                ? Screen.FromRectangle(boundsBeforeAttach).WorkingArea
+                : RecoverAccessibleBounds(boundsBeforeAttach);
+            if (Bounds != boundsBeforeAttach)
+                Bounds = boundsBeforeAttach;
         }
         AttachToDesktop();
     }
 
+    /// <summary>
+    /// After monitor removal, Windows may leave a normal top-level window
+    /// (interactive or plain click-through) mostly offscreen. Only relocate
+    /// inaccessible bounds; preserve Maximize state and the usable restore
+    /// rectangle. Avoid touching WorkerW attachment transitions.
+    /// </summary>
+    private void ReconcileTopLevelGeometry()
+    {
+        if (!IsHandleCreated || IsDisposed || attachedToDesktop ||
+            desktopStateSnapshotValid || reparentInProgress || nativeMoveSizeActive ||
+            WindowState == FormWindowState.Minimized)
+            return;
+
+        bool maximized = WindowState == FormWindowState.Maximized;
+        var normal = maximized ? RestoreBounds : Bounds;
+        if (!NeedsOffscreenRecovery(normal))
+            return;
+
+        var recovered = RecoverAccessibleBounds(normal);
+        if (maximized)
+        {
+            // WinForms exposes RestoreBounds only as a getter. Change it
+            // through a brief Normal state, then restore maximization; this
+            // path runs only for an actually inaccessible restore rectangle.
+            WindowState = FormWindowState.Normal;
+            Bounds = recovered;
+            WindowState = FormWindowState.Maximized;
+        }
+        else
+            Bounds = recovered;
+
+        SaveBounds();
+        settings.Save();
+    }
+
+    /// <summary>
+    /// If wallpaper is requested but Explorer has not supplied WorkerW, the
+    /// window remains a normal top-level (taskbar-hidden) fallback. Keep that
+    /// fallback on a visible monitor without interrupting a pending reparent.
+    /// </summary>
+    private void ReconcileUnattachedWallpaperFallback()
+    {
+        if (attachedToDesktop || reparentInProgress || desktopDiscoveryInFlight ||
+            nativeMoveSizeActive)
+            return;
+
+        if (!desktopStateSnapshotValid)
+        {
+            ReconcileTopLevelGeometry();
+            return;
+        }
+
+        // A destroyed WorkerW leaves a top-level HWND yet the wallpaper
+        // maximize/restore snapshot intentionally stays valid. The regular
+        // top-level method skips it to avoid persisting temporary bounds.
+        // Reconcile here without discarding that snapshot.
+        if (WindowState == FormWindowState.Minimized)
+            return;
+
+        if (maximizedBeforeAttach)
+        {
+            var work = Screen.FromRectangle(boundsBeforeAttach).WorkingArea;
+            normalBoundsBeforeAttach = RecoverAccessibleBounds(normalBoundsBeforeAttach);
+            if (Bounds != work)
+                Bounds = work;
+            boundsBeforeAttach = work;
+        }
+        else
+        {
+            // Prefer the actual window location when Windows has already moved
+            // it successfully to the remaining monitors.
+            if (NeedsOffscreenRecovery(Bounds))
+                Bounds = RecoverAccessibleBounds(Bounds);
+            if (NeedsOffscreenRecovery(boundsBeforeAttach) || boundsBeforeAttach != Bounds)
+                boundsBeforeAttach = Bounds;
+        }
+    }
+
+    private void ReconcileDisplayConfiguration()
+    {
+        if (IsDisposed || Disposing || !IsHandleCreated)
+            return;
+        if (settings.BehindDesktopIcons && isClickThrough)
+        {
+            ReconcileUnattachedWallpaperFallback();
+            ReconcileAttachedGeometry();
+            EnsureDesktopAttachment();
+        }
+        else
+            ReconcileTopLevelGeometry();
+    }
+
+    /// <summary>
+    /// Retry the requested wallpaper disable after a transient native failure.
+    /// Keep click-through enabled until we have verified top-level parenting.
+    /// </summary>
+    private void RetryPendingWallpaperDetach()
+    {
+        if (!pendingWallpaperDetach || settings.BehindDesktopIcons ||
+            !isClickThrough || pendingInteractiveDetach)
+            return;
+        if (!DetachFromDesktop())
+        {
+            RecordDesktopDiscoveryFailure();
+            return;
+        }
+        pendingWallpaperDetach = false;
+        ResetDesktopDiscoveryBackoff();
+        NativeMethods.SendToBottom(Handle);
+    }
+
     public void SetBehindDesktopIcons(bool behind)
     {
-        settings.BehindDesktopIcons = behind;
+        settings.BehindDesktopIcons = behind; // desired mode, regardless of native outcome
+        pendingWallpaperDetach = false; // explicit user toggle supersedes prior request
+        ResetDesktopDiscoveryBackoff();
         settingsForm?.SyncBehindDesktopIcons(behind);
         if (isClickThrough)
         {
             if (behind)
-            {
                 AttachToDesktop();
+            else if (!DetachFromDesktop())
+            {
+                pendingWallpaperDetach = true;
+                RecordDesktopDiscoveryFailure();
             }
             else
-            {
-                DetachFromDesktop();
                 NativeMethods.SendToBottom(Handle);
-            }
         }
         settings.Save();
         SyncSettingsControls();
@@ -891,8 +1315,46 @@ public class MainForm : Form
         hoverHideDeadline = DateTime.Now.AddSeconds(2);  // CheckMouseHover hides it unless hovered
     }
 
+    private void QueueTopLevelStyleRepair(int previousError)
+    {
+        pendingAttachedStyleRepair = false;
+        // No error means SetParent and its top-level style/frame update both
+        // succeeded. Otherwise retry independently even in interactive mode.
+        pendingTopLevelStyleRepair = previousError != 0;
+        nextTopLevelStyleRepairAt = Environment.TickCount64 + 1000;
+    }
+
+    private void RetryTopLevelStyleRepair()
+    {
+        if (!pendingTopLevelStyleRepair || !IsHandleCreated || IsDisposed ||
+            reparentInProgress || attachedToDesktop ||
+            Environment.TickCount64 < nextTopLevelStyleRepairAt)
+            return;
+
+        nextTopLevelStyleRepairAt = Environment.TickCount64 + 1000;
+        if (!NativeMethods.HasDesktopParent(Handle))
+            return; // A different native parent cannot be repaired as top-level.
+
+        if (NativeMethods.TryRepairParentStyle(Handle, attached: false,
+                out int error, forceFrameRefresh: true))
+            pendingTopLevelStyleRepair = false;
+        else
+            System.Diagnostics.Debug.WriteLine($"Top-level style retry failed: {error}");
+    }
+
     private void CheckMouseHover()
     {
+        // This is not gated by click-through or wallpaper mode: a successful
+        // detach may need a delayed WS_POPUP/frame repair in interactive mode.
+        RetryTopLevelStyleRepair();
+        // Retry failed worker-parent detach without sacrificing safe click-through.
+        if (pendingInteractiveDetach && !isClickThrough == false &&
+            Environment.TickCount64 >= nextDesktopDiscoveryAt)
+            SetClickThrough(false);
+        else if (pendingWallpaperDetach && isClickThrough &&
+                 Environment.TickCount64 >= nextDesktopDiscoveryAt)
+            RetryPendingWallpaperDetach();
+
         // interactive mode: controls are integrated in the title bar; the corner panel only
         // shows as a settings preview, which just has to time out
         if (!isClickThrough)
@@ -1047,7 +1509,8 @@ public class MainForm : Form
 
     private void SaveBounds()
     {
-        if (attachedToDesktop || WindowState == FormWindowState.Minimized) return;
+        if (attachedToDesktop || desktopStateSnapshotValid || reparentInProgress ||
+            WindowState == FormWindowState.Minimized) return;
         var normal = WindowState == FormWindowState.Maximized ? RestoreBounds : Bounds;
         if (normal.Width < 100 || normal.Height < 100) return;
         settings.WinX = normal.X;
