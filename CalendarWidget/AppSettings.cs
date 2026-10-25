@@ -22,6 +22,14 @@ public class AppSettings
     // window chrome can be hidden without changing interaction or desktop attachment
     public bool ShowTitleBar { get; set; } = true;
 
+    // Existing interactive-window behavior: dragging and resizing are enabled by default.
+    // Preserve the user's choice across switching to click-through and restarting.
+    public bool LayoutUnlocked { get; set; } = true;
+
+    // The app icon remains the default; users can opt into the date indicator.
+    public bool UseDateTrayIcon { get; set; }
+
+
     // widget mode sits behind the desktop icons (live-wallpaper style, WorkerW reparenting)
     public bool BehindDesktopIcons { get; set; }
 
