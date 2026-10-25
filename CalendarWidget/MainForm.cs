@@ -131,8 +131,8 @@ public class MainForm : Form
     /// </summary>
     private Padding ModePadding()
     {
-        int bar = (settings.ShowTitleBar || (!isClickThrough && isLayoutUnlocked))
-            ? titleBar.BarHeight : 0;
+        // Layout editing never overrides the explicit Show title bar preference.
+        int bar = settings.ShowTitleBar ? titleBar.BarHeight : 0;
         if (isClickThrough)
             return new Padding(0, bar, 0, 0);
         int frame = isLayoutUnlocked ? LogicalToDeviceUnits(6) : 0;
@@ -273,7 +273,7 @@ public class MainForm : Form
     {
         titleBar.SetLayoutUnlocked(isLayoutUnlocked && !isClickThrough);
         if (!IsHandleCreated) return;
-        if (settings.ShowTitleBar || (!isClickThrough && isLayoutUnlocked))
+        if (settings.ShowTitleBar)
         {
             if (!titleBar.Visible)
             {
@@ -284,6 +284,25 @@ public class MainForm : Form
         }
         else if (titleBar.Visible)
             titleBar.Hide();
+    }
+
+    // When the title is hidden, the native system move command remains available
+    // from the tray/Settings; keyboard arrows move, Enter confirms, Escape cancels.
+    public void BeginKeyboardMove()
+    {
+        if (isClickThrough || !isLayoutUnlocked || !IsHandleCreated)
+            return;
+        settingsForm?.Hide();
+        BeginInvoke(() =>
+        {
+            if (IsDisposed || isClickThrough || !isLayoutUnlocked)
+                return;
+            Activate();
+            NativeMethods.SendMessage(Handle, NativeMethods.WM_SYSCOMMAND,
+                new IntPtr(NativeMethods.SC_MOVE), IntPtr.Zero);
+            if (settingsForm is { IsDisposed: false })
+                settingsForm.ShowAndActivate();
+        });
     }
 
     private void SyncSettingsControls() =>
@@ -915,11 +934,14 @@ public class MainForm : Form
             (_, _) => ToggleClickThrough());
         var layoutItem = new ToolStripMenuItem("Move / resize window", null,
             (_, _) => SetLayoutEditing(!isLayoutUnlocked));
+        var moveItem = new ToolStripMenuItem("Move window (keyboard)…", null,
+            (_, _) => BeginKeyboardMove());
         var behindItem = new ToolStripMenuItem("Behind desktop icons (live wallpaper)", null,
             (_, _) => SetBehindDesktopIcons(!settings.BehindDesktopIcons));
         menu.Items.Add(headerItem);
         menu.Items.Add(interactionItem);
         menu.Items.Add(layoutItem);
+        menu.Items.Add(moveItem);
         menu.Items.Add(behindItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Settings…", null, (_, _) => ShowSettings());
@@ -930,6 +952,7 @@ public class MainForm : Form
             headerItem.Checked = settings.ShowTitleBar;
             interactionItem.Checked = !isClickThrough;
             layoutItem.Checked = isLayoutUnlocked;
+            moveItem.Enabled = !isClickThrough && isLayoutUnlocked;
             behindItem.Checked = settings.BehindDesktopIcons;
         };
         tray.Icon = Icon ?? SystemIcons.Application;
