@@ -136,6 +136,14 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     private static extern IntPtr GetDesktopWindow();
 
+    /// <summary>Resolve an active dialog to its root owner for safe Z-order placement.</summary>
+    public static IntPtr RootOwner(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) return IntPtr.Zero;
+        var root = GetAncestor(hwnd, GA_ROOTOWNER);
+        return root != IntPtr.Zero && IsWindow(root) ? root : hwnd;
+    }
+
     [DllImport("user32.dll")]
     private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
 
