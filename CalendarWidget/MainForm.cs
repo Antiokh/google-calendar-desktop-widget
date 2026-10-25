@@ -50,7 +50,25 @@ public class MainForm : Form
     private long nextTopLevelStyleRepairAt;
     private bool desktopStateSnapshotValid;
     private bool reparentInProgress;
-    private int reparentGeneration;          // throttle for the behind-icons re-attach watchdog
+    private int reparentGeneration;
+    private bool interactiveDesktopTopmost;
+    private bool updatingDesktopVisibility;
+    private int showDesktopPoll;
+    private const long ForegroundSettleMs = 180;
+    private const long PromotionRetryMs = 1000;
+    private IntPtr pendingDemotionForeground;
+    private long pendingDemotionStartedAt;
+    private long nextPromotionAttemptAt;
+    private long restoreTransitionUntil;
+    private long restoreForegroundHintUntil;
+    private long pendingRestoreZOrderCheckAt;
+    private IntPtr lastForegroundEventWindow;
+    // A tray or Settings window may take focus while Show Desktop is active.
+    // Track the desktop episode until an unrelated application takes focus.
+    private bool showDesktopEpisodeActive;
+    private readonly NativeMethods.WinEventProc foregroundCallback;
+    private IntPtr foregroundHook;
+    private IntPtr restoreHook;          // throttle for the behind-icons re-attach watchdog
     private bool attachedToDesktop;       // reparented into WorkerW (behind the desktop icons)
     private IntPtr attachedWorkerW;       // the specific WorkerW we parented into; its destruction = orphaned
     private Rectangle boundsBeforeAttach; // screen bounds to restore on detach (child coords are parent-relative)
@@ -60,6 +78,7 @@ public class MainForm : Form
 
     public MainForm()
     {
+        foregroundCallback = OnForegroundWindowChanged;
         Text = "Google Calendar Desktop Widget";
         FormBorderStyle = FormBorderStyle.None;  // always borderless; TitleBar is the caption in interactive mode
         ShowInTaskbar = false;
@@ -100,6 +119,7 @@ public class MainForm : Form
         {
             var cp = base.CreateParams;
             cp.Style |= NativeMethods.WS_CAPTION | NativeMethods.WS_THICKFRAME | NativeMethods.WS_MAXIMIZEBOX;
+            cp.Style &= ~NativeMethods.WS_MINIMIZEBOX;
             return cp;
         }
     }
@@ -256,6 +276,14 @@ public class MainForm : Form
     {
         base.OnLoad(e);
 
+        lastForegroundEventWindow = NativeMethods.GetForegroundWindow();
+        foregroundHook = NativeMethods.SetWinEventHook(
+            NativeMethods.EVENT_SYSTEM_FOREGROUND, NativeMethods.EVENT_SYSTEM_FOREGROUND,
+            IntPtr.Zero, foregroundCallback, 0, 0, NativeMethods.WINEVENT_OUTOFCONTEXT);
+        restoreHook = NativeMethods.SetWinEventHook(
+            NativeMethods.EVENT_SYSTEM_MINIMIZEEND, NativeMethods.EVENT_SYSTEM_MINIMIZEEND,
+            IntPtr.Zero, foregroundCallback, 0, 0, NativeMethods.WINEVENT_OUTOFCONTEXT);
+
         // start the bar on the owner's monitor so it is created at that monitor's DPI
         titleBar.Location = PointToScreen(Point.Empty);
         titleBar.Show(this);  // owned controls can be available in either mode
@@ -370,12 +398,15 @@ public class MainForm : Form
 
     private void SyncSettingsControls() =>
         settingsForm?.SyncTrayOptions(!isClickThrough, isLayoutUnlocked,
-            settings.ShowTitleBar, settings.BehindDesktopIcons);
+            settings.ShowTitleBar, settings.BehindDesktopIcons,
+            settings.KeepInteractiveVisibleOnDesktop);
 
     private void SetClickThrough(bool enable)
     {
         if (enable)
         {
+            showDesktopEpisodeActive = false;
+            ReleaseInteractiveDesktopPromotion();
             pendingInteractiveDetach = false;
             if (!settings.BehindDesktopIcons && attachedToDesktop)
                 pendingWallpaperDetach = true;
@@ -426,6 +457,253 @@ public class MainForm : Form
         SyncSettingsControls();
         ApplyEdgeShadows();  // widget mode only: they'd hide content while interacting
         settings.Save();
+        MaintainInteractiveDesktopVisibility();
+    }
+
+    /// <summary>
+    /// Foreground changes drive Z-order reconciliation. MINIMIZEEND is merely
+    /// a hint that restoration might be underway: background programs can
+    /// restore windows without exiting Show Desktop. Only a real foreground
+    /// departure may release temporary TOPMOST. The watchdog is a fallback.
+    /// </summary>
+    private void OnForegroundWindowChanged(
+        IntPtr hook, uint eventType, IntPtr hwnd,
+        int idObject, int idChild, uint eventThread, uint eventTime)
+    {
+        if (idObject != 0 || idChild != 0 || IsDisposed || Disposing)
+            return;
+
+        if (eventType == NativeMethods.EVENT_SYSTEM_MINIMIZEEND)
+        {
+            // Do not demote here. Two background windows can be restored by
+            // another process while Explorer still owns the foreground.
+            // If focus actually leaves the desktop shortly afterwards, bypass
+            // the normal 180 ms settling delay to complete restoration quickly.
+            if (hwnd != IntPtr.Zero && hwnd != Handle && !isClickThrough &&
+                settings.KeepInteractiveVisibleOnDesktop && IsHandleCreated &&
+                NativeMethods.IsTopmost(Handle) &&
+                NativeMethods.IsDesktopForeground(NativeMethods.GetForegroundWindow()))
+                restoreForegroundHintUntil = Environment.TickCount64 + 500;
+            return;
+        }
+
+        if (eventType == NativeMethods.EVENT_SYSTEM_FOREGROUND)
+        {
+            bool desktopNow = NativeMethods.IsDesktopForeground(hwnd);
+            if (desktopNow)
+                showDesktopEpisodeActive = true;
+            else if (hwnd != IntPtr.Zero && !IsOurForegroundWindow(hwnd))
+                showDesktopEpisodeActive = false; // a real app switch ended Win+D
+
+            bool desktopPreviously = NativeMethods.IsDesktopForeground(lastForegroundEventWindow);
+            if (desktopNow && !desktopPreviously)
+            {
+                // A new Win+D starts a distinct desktop foreground episode.
+                restoreForegroundHintUntil = 0;
+                pendingRestoreZOrderCheckAt = 0;
+                if (lastForegroundEventWindow != IntPtr.Zero)
+                {
+                    restoreTransitionUntil = 0;
+                    nextPromotionAttemptAt = 0;
+                }
+            }
+            else if (!desktopNow && hwnd != IntPtr.Zero)
+            {
+                restoreTransitionUntil = 0;
+                // Our own controls gaining focus is not an Explorer restore.
+                if (IsOurForegroundWindow(hwnd) || !desktopPreviously)
+                    restoreForegroundHintUntil = 0;
+            }
+            lastForegroundEventWindow = hwnd;
+            MaintainInteractiveDesktopVisibility();
+        }
+    }
+
+    private bool IsOurForegroundWindow(IntPtr hwnd) =>
+        hwnd == Handle ||
+        (titleBar.IsHandleCreated && hwnd == titleBar.Handle) ||
+        (settingsForm is not null && settingsForm.IsHandleCreated &&
+         hwnd == settingsForm.Handle) ||
+        (tray.ContextMenuStrip is { IsHandleCreated: true } menu &&
+         hwnd == menu.Handle);
+
+    private void CancelPendingDesktopDemotion()
+    {
+        pendingDemotionForeground = IntPtr.Zero;
+        pendingDemotionStartedAt = 0;
+    }
+
+    /// <summary>
+    /// Make only necessary Z-order changes. The source of truth is the
+    /// window's current WS_EX_TOPMOST bit and foreground HWND, not merely the
+    /// previous request recorded in interactiveDesktopTopmost.
+    /// </summary>
+    private void MaintainInteractiveDesktopVisibility()
+    {
+        if (updatingDesktopVisibility || !IsHandleCreated || IsDisposed)
+            return;
+
+        updatingDesktopVisibility = true;
+        try
+        {
+            long now = Environment.TickCount64;
+            bool isReallyTopmost = NativeMethods.IsTopmost(Handle);
+
+            if (isClickThrough || !settings.KeepInteractiveVisibleOnDesktop)
+            {
+                pendingRestoreZOrderCheckAt = 0;
+                CancelPendingDesktopDemotion();
+                if (isReallyTopmost || interactiveDesktopTopmost)
+                    ReleaseInteractiveDesktopPromotion();
+                return;
+            }
+
+            IntPtr foreground = NativeMethods.GetForegroundWindow();
+            if (NativeMethods.IsDesktopForeground(foreground))
+            {
+                pendingRestoreZOrderCheckAt = 0;
+                CancelPendingDesktopDemotion();
+                if (isReallyTopmost)
+                {
+                    interactiveDesktopTopmost = true;
+                    return;  // no extra SetWindowPos call on each event/poll
+                }
+
+                interactiveDesktopTopmost = false;
+                if (now < nextPromotionAttemptAt || now < restoreTransitionUntil)
+                    return;  // avoid fighting Explorer during window restoration
+
+                nextPromotionAttemptAt = now + PromotionRetryMs;
+                if (NativeMethods.IsIconic(Handle))
+                    WindowState = settings.WinMaximized
+                        ? FormWindowState.Maximized : FormWindowState.Normal;
+
+                if (NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_TOPMOST,
+                    0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE))
+                    interactiveDesktopTopmost = NativeMethods.IsTopmost(Handle);
+                return;
+            }
+
+            if (!isReallyTopmost)
+            {
+                interactiveDesktopTopmost = false;
+                CancelPendingDesktopDemotion();
+                if (pendingRestoreZOrderCheckAt != 0 &&
+                    now >= pendingRestoreZOrderCheckAt)
+                {
+                    // Explorer's restore animation has finished. Most Win+D
+                    // sequences leave the native order correct: only change
+                    // it if our HWND still sits above the active app's owner.
+                    pendingRestoreZOrderCheckAt = 0;
+                    if (foreground != IntPtr.Zero && !IsOurForegroundWindow(foreground))
+                        PlaceBelowForegroundAppIfNeeded(foreground);
+                }
+                return;
+            }
+
+            // Our own calendar / settings gaining focus is not the end of
+            // desktop mode. A null foreground is also a transient shell state.
+            if (foreground == IntPtr.Zero || IsOurForegroundWindow(foreground))
+            {
+                CancelPendingDesktopDemotion();
+                return;
+            }
+
+            // A restore hint never removes TOPMOST by itself. A confirmed
+            // foreground departure permits early demotion, but the reverse
+            // Show Desktop animation must not insert the widget behind an
+            // arbitrary app HWND: that second Z-order change caused flicker.
+            if (restoreForegroundHintUntil != 0 && now <= restoreForegroundHintUntil)
+            {
+                restoreForegroundHintUntil = 0;
+                restoreTransitionUntil = now + 1200;
+                ReleaseInteractiveDesktopPromotion(); // HWND_NOTOPMOST only
+                // A generic MINIMIZEEND may have been unrelated to Win+D.
+                // Defer the normal-app Z-order check until Explorer has had
+                // time to complete any genuine restore animation.
+                if (!NativeMethods.IsTopmost(Handle))
+                    pendingRestoreZOrderCheckAt = restoreTransitionUntil;
+                return;
+            }
+            restoreForegroundHintUntil = 0;
+            if (pendingDemotionForeground != foreground)
+            {
+                pendingDemotionForeground = foreground;
+                pendingDemotionStartedAt = now;
+            }
+
+            // With no matching minimize hint, wait for foreground stability.
+            // Never force HWND_BOTTOM during the reverse Show Desktop gesture.
+            if (now - pendingDemotionStartedAt >= ForegroundSettleMs)
+            {
+                ReleaseInteractiveDesktopPromotion(foreground);
+                CancelPendingDesktopDemotion();
+            }
+        }
+        finally
+        {
+            updatingDesktopVisibility = false;
+        }
+    }
+
+    /// <summary>
+    /// Reposition only if our calendar is still above the foreground app's
+    /// root owner. Do not disturb Z-order if Explorer already fixed it.
+    /// Called after a settled ordinary switch, or as a delayed safety check
+    /// after an ambiguous MINIMIZEEND hint.
+    /// </summary>
+    private void PlaceBelowForegroundAppIfNeeded(IntPtr foreground)
+    {
+        if (foreground == IntPtr.Zero || foreground == Handle ||
+            !NativeMethods.IsWindow(foreground) ||
+            NativeMethods.IsDesktopForeground(foreground) ||
+            NativeMethods.IsTopmost(foreground) ||
+            NativeMethods.IsTopmost(Handle))
+            return;
+
+        IntPtr rootOwner = NativeMethods.RootOwner(foreground);
+        IntPtr anchor = rootOwner != IntPtr.Zero && rootOwner != Handle &&
+            !NativeMethods.IsTopmost(rootOwner) ? rootOwner : foreground;
+        if (anchor == Handle || !NativeMethods.IsAboveInZOrder(Handle, anchor))
+            return; // already below the active app, no flicker-inducing move
+
+        if (!NativeMethods.SetWindowPos(Handle, anchor,
+                0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE))
+            System.Diagnostics.Debug.WriteLine("Could not place calendar below foreground app owner");
+    }
+
+    private void ReleaseInteractiveDesktopPromotion(IntPtr stableAppForeground = default)
+    {
+        CancelPendingDesktopDemotion();
+        if (!IsHandleCreated)
+        {
+            interactiveDesktopTopmost = false;
+            return;
+        }
+
+        // Only a genuinely topmost window requires changing the native Z-order.
+        if (!NativeMethods.IsTopmost(Handle))
+        {
+            interactiveDesktopTopmost = false;
+            return;
+        }
+
+        // Keep the proven reverse-Win+D behavior: never force HWND_BOTTOM.
+        // HWND_NOTOPMOST alone raises us to the top of the *ordinary* band,
+        // however. On a confirmed ordinary app switch, position the widget
+        // below the foreground app after removing its TOPMOST status.
+        if (!NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_NOTOPMOST,
+                0, 0, 0, 0, NativeMethods.SWP_NOSIZE_NOMOVE_NOACTIVATE))
+            return;
+        interactiveDesktopTopmost = NativeMethods.IsTopmost(Handle);
+        if (interactiveDesktopTopmost)
+            return;
+
+        // Reverse Win+D passes no foreground anchor and remains a one-call
+        // HWND_NOTOPMOST operation. Ordinary app switches are positioned below
+        // their root owner, but only if the current native order requires it.
+        if (stableAppForeground != IntPtr.Zero)
+            PlaceBelowForegroundAppIfNeeded(stableAppForeground);
     }
 
     // Passive windows are positioned relative to Explorer's desktop layer.
@@ -1338,6 +1616,12 @@ public class MainForm : Form
     private void CheckMouseHover()
     {
         RetryTopLevelStyleRepair();
+        if (pendingDemotionForeground != IntPtr.Zero ||
+            pendingRestoreZOrderCheckAt != 0 || ++showDesktopPoll >= 10)
+        {
+            showDesktopPoll = 0;
+            MaintainInteractiveDesktopVisibility();
+        }
         // Retry failed worker-parent detach without sacrificing safe click-through.
         if (pendingInteractiveDetach && !isClickThrough == false &&
             Environment.TickCount64 >= nextDesktopDiscoveryAt)
@@ -1478,11 +1762,14 @@ public class MainForm : Form
             (_, _) => BeginKeyboardMove());
         var behindItem = new ToolStripMenuItem("Behind desktop icons (live wallpaper)", null,
             (_, _) => SetBehindDesktopIcons(!settings.BehindDesktopIcons));
+        var showDesktopItem = new ToolStripMenuItem("Stay visible on Show Desktop (experimental)", null,
+            (_, _) => SetStayVisibleOnShowDesktop(!settings.KeepInteractiveVisibleOnDesktop));
         menu.Items.Add(headerItem);
         menu.Items.Add(interactionItem);
         menu.Items.Add(layoutItem);
         menu.Items.Add(moveItem);
         menu.Items.Add(behindItem);
+        menu.Items.Add(showDesktopItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Settings…", null, (_, _) => ShowSettings());
         menu.Items.Add(new ToolStripSeparator());
@@ -1494,12 +1781,38 @@ public class MainForm : Form
             layoutItem.Checked = isLayoutUnlocked;
             moveItem.Enabled = !isClickThrough && isLayoutUnlocked;
             behindItem.Checked = settings.BehindDesktopIcons;
+            showDesktopItem.Checked = settings.KeepInteractiveVisibleOnDesktop;
         };
         tray.Icon = Icon ?? SystemIcons.Application;
         tray.Text = "Google Calendar Desktop Widget";
         tray.ContextMenuStrip = menu;
         tray.Visible = true;
         tray.DoubleClick += (_, _) => ToggleClickThrough();
+    }
+
+    public void SetStayVisibleOnShowDesktop(bool enabled)
+    {
+        settings.KeepInteractiveVisibleOnDesktop = enabled;
+        settings.Save();
+        if (!enabled)
+        {
+            // Keep the Win+D episode while our own Settings/tray UI has focus.
+            // During ordinary app focus this flag is cleared by the foreground
+            // event hook; sending the taskbar-hidden calendar to HWND_BOTTOM in
+            // that case would make it vanish.
+            bool desktopEpisode = IsHandleCreated &&
+                (showDesktopEpisodeActive ||
+                 NativeMethods.IsDesktopForeground(NativeMethods.GetForegroundWindow()));
+            ReleaseInteractiveDesktopPromotion();
+            if (!isClickThrough && desktopEpisode)
+            {
+                NativeMethods.SendToBottom(Handle);
+                interactiveDesktopTopmost = NativeMethods.IsTopmost(Handle);
+            }
+        }
+        else
+            MaintainInteractiveDesktopVisibility();
+        SyncSettingsControls();
     }
 
     public void ShowSettings()
@@ -1535,6 +1848,11 @@ public class MainForm : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        if (foregroundHook != IntPtr.Zero)
+            NativeMethods.UnhookWinEvent(foregroundHook);
+        if (restoreHook != IntPtr.Zero)
+            NativeMethods.UnhookWinEvent(restoreHook);
+        ReleaseInteractiveDesktopPromotion();
         hoverPoll.Stop();
         tray.Visible = false;
         tray.Dispose();

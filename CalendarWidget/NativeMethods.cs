@@ -17,6 +17,10 @@ internal static class NativeMethods
     public const long WS_EX_TRANSPARENT = 0x00000020;  // mouse passes through
     public const long WS_EX_NOACTIVATE = 0x08000000;   // never steals keyboard focus
     public const long WS_EX_TOPMOST = 0x00000008;
+    public const int WS_MINIMIZEBOX = 0x00020000;
+    public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    public const uint EVENT_SYSTEM_MINIMIZEEND = 0x0017;
+    public const uint WINEVENT_OUTOFCONTEXT = 0;
 
     public const int WM_WINDOWPOSCHANGING = 0x0046;
     public const int WM_ENTERSIZEMOVE = 0x0231;
@@ -31,6 +35,8 @@ internal static class NativeMethods
     public const uint SWP_NOSIZE_NOMOVE_NOACTIVATE = 0x0013;
 
     public static readonly IntPtr HWND_BOTTOM = new(1);
+    public static readonly IntPtr HWND_TOPMOST = new(-1);
+    public static readonly IntPtr HWND_NOTOPMOST = new(-2);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct WINDOWPOS
@@ -129,17 +135,6 @@ internal static class NativeMethods
     private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
     [DllImport("user32.dll")]
     private static extern IntPtr GetDesktopWindow();
-
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetForegroundWindow();
-
-    /// <summary>Resolve dialogs to their owning application for safe passive placement.</summary>
-    public static IntPtr RootOwner(IntPtr hwnd)
-    {
-        if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) return IntPtr.Zero;
-        var root = GetAncestor(hwnd, GA_ROOTOWNER);
-        return root != IntPtr.Zero && IsWindow(root) ? root : hwnd;
-    }
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
@@ -350,6 +345,24 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetClassNameW(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    // Foreground changes arrive on our WinForms message-loop thread, much
+    // sooner than a periodic foreground-window poll.
+    public delegate void WinEventProc(
+        IntPtr hook, uint eventType, IntPtr hwnd,
+        int idObject, int idChild, uint eventThread, uint eventTime);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetWinEventHook(
+        uint eventMin, uint eventMax, IntPtr module,
+        WinEventProc callback, uint processId, uint threadId, uint flags);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool UnhookWinEvent(IntPtr hook);
 
     /// <summary>Win+D / Show Desktop activates the Explorer desktop window.</summary>
     public static bool IsDesktopForeground(IntPtr window)
